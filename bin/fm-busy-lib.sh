@@ -34,6 +34,10 @@
 #   codex-hook, codex-appserver  reserved: Codex, gated by
 #                    fm_busy_codex_semantic_source
 #   kimi-wire, kimi-hook  reserved: standalone Kimi, gated by fm_busy_kimi_verified
+# agy has no semantic source and no reserved name: no agy lifecycle surface is
+# verified to fire for a firstmate-launched worker, so it trusts nothing, records
+# nothing, and classifies unknown missing. It gets no rendered-text fallback
+# either; the Grok arm below is a grandfathered exception, not a pattern.
 # Firstmate-owned sources accepted for every converted adapter:
 #   fm-spawn         the launch-brief turn seeded at spawn
 #   fm-interrupt     a firstmate-controlled interruption of the worker

@@ -83,8 +83,10 @@
 #   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
 #   harness (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
-#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi)
-#   overrides it for this spawn (either kind). A non-flag string containing
+#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi|agy)
+#   overrides it for this spawn (either kind), except that agy is verified for
+#   crewmates and scouts only: a named agy secondmate spawn is refused before any
+#   endpoint is created. A non-flag string containing
 #   whitespace is treated as a RAW launch command - the escape hatch for verifying
 #   new adapters. pi-signed launches that exact executable name from PATH and
 #   refuses before endpoint creation when it is unavailable; it never falls back to pi.
@@ -133,6 +135,9 @@
 # a firstmate-owned global hook and registry, and a gitignored per-task pointer.
 # grok uses a firstmate-owned global hook under ${GROK_HOME:-$HOME/.grok}/hooks
 # plus a gitignored .fm-grok-turnend worktree pointer and a state token.
+# agy installs no turn-end hook: no agy lifecycle surface is verified to fire for
+# a firstmate-launched worker yet, so an agy task is supervised by stale-pane
+# detection alone. The harness-adapters skill owns that recorded gap.
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> [mode=<mode> yolo=<on|off>] window=<backend-target> worktree=<path>
 # A ship task records the explicit mode/yolo it was passed; a secondmate spawn records
 # mode=secondmate, yolo=off, home=, and projects=; a scout records neither, and both the
@@ -217,6 +222,29 @@ fm_refuse_if_gate_agent
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
+
+# The verified adapter names, and the subset verified for SECONDMATE launches.
+# Two lists rather than one because a secondmate is a different contract from a
+# crewmate: a persistent home, an idle charter, and marked routed replies rather
+# than one supervised task in a disposable worktree. An adapter joins the second
+# list only once that whole path is verified end to end.
+# agy is crewmate/scout-only for that reason; its secondmate path is unverified,
+# so a named agy secondmate spawn refuses instead of launching an unproven
+# identity into a persistent home. The raw-launch escape hatch stays available,
+# because that is how the secondmate path would be verified.
+FM_VERIFIED_HARNESSES='claude codex opencode pi pi-signed grok kimi agy'
+FM_SECONDMATE_HARNESSES='claude codex opencode pi pi-signed grok kimi'
+
+harness_is_verified() {  # <harness>
+  case " $FM_VERIFIED_HARNESSES " in *" ${1:-} "*) return 0 ;; esac
+  return 1
+}
+
+harness_supports_secondmate() {  # <harness>
+  case " $FM_SECONDMATE_HARNESSES " in *" ${1:-} "*) return 0 ;; esac
+  return 1
+}
+
 KIND=ship
 HARNESS_ARG=
 MODEL=
@@ -375,15 +403,16 @@ spawn_remote_secondmate() {
   else
     harness=$("$FM_ROOT/bin/fm-harness.sh" secondmate)
   fi
-  case "$harness" in
-    claude|codex|opencode|pi|pi-signed|grok|kimi) ;;
-    *)
-      fm_lock_release "$registry_lock" || true
-      fm_lock_release "$SPAWN_TASK_LOCK" || true
-      echo "error: remote secondmate spawn requires a verified harness adapter, not a raw launch command: $harness" >&2
-      return 1
-      ;;
-  esac
+  if ! harness_supports_secondmate "$harness"; then
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    if harness_is_verified "$harness"; then
+      echo "error: harness '$harness' is verified for crewmates only, not for secondmate launches" >&2
+    else
+      echo "error: remote secondmate spawn requires a secondmate-verified harness adapter, not a raw launch command: $harness" >&2
+    fi
+    return 1
+  fi
   model=${MODEL:--}
   effort=${EFFORT:--}
   if [ -z "$HARNESS_ARG" ] && [ -z "$positional" ]; then
@@ -782,9 +811,12 @@ ARG3=
 FIRSTMATE_HOME=
 
 if [ "$KIND" = secondmate ]; then
+  # Every verified adapter name is recognized here, including the crewmate-only
+  # ones, so a positional `agy` is understood as a harness selection and refused
+  # by name below rather than misread as a firstmate home path.
   case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|pi-signed|grok|kimi)
-      ARG3=${POS[1]:-}
+    '')
+      ARG3=
       ;;
     *' '*)
       if [ "${#POS[@]}" -gt 2 ] || [ -d "${POS[1]}" ]; then
@@ -795,8 +827,12 @@ if [ "$KIND" = secondmate ]; then
       fi
       ;;
     *)
-      FIRSTMATE_HOME=${POS[1]}
-      ARG3=${POS[2]:-}
+      if harness_is_verified "${POS[1]}"; then
+        ARG3=${POS[1]}
+      else
+        FIRSTMATE_HOME=${POS[1]}
+        ARG3=${POS[2]:-}
+      fi
       ;;
   esac
 else
@@ -849,12 +885,26 @@ launch_template() {
     # Its turn-end signal is a globally configured Stop hook plus a guarded
     # per-task worktree token, so no launch placeholder belongs here.
     kimi) printf '%s' '__KIMIBIN__ __MODELFLAG__--auto' ;;
+    # agy (Antigravity CLI): -i/--prompt-interactive runs the brief as an initial
+    # prompt and then stays interactive, which is the supervised shape firstmate
+    # needs; --dangerously-skip-permissions auto-approves every tool request, the
+    # equivalent of claude's flag of the same name (verified: the crewmate runs a
+    # full task end to end unattended). No turn-end placeholder appears here
+    # because no agy turn-end hook is verified yet - agy tasks rely on stale-pane
+    # detection alone (see the harness-adapters skill).
+    agy) printf '%s' 'agy --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__-i "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     *) return 1 ;;
   esac
 }
 
+# 1 when this spawn selected a NAMED verified adapter, 0 for the raw launch
+# command. The secondmate-capability guard below applies only to a named
+# selection, so the raw escape hatch stays available for verifying a new
+# secondmate path.
+HARNESS_NAMED=1
 case "$ARG3" in
   *' '*)  # raw launch command (unverified-adapter escape hatch)
+    HARNESS_NAMED=0
     LAUNCH=$ARG3
     HARNESS=""
     for word in $LAUNCH; do
@@ -892,6 +942,14 @@ esac
 case "$HARNESS" in
   pi|pi-signed) LAUNCH="FM_PI_HARNESS=$HARNESS $LAUNCH" ;;
 esac
+
+# A crewmate-only adapter never reaches a persistent secondmate home. Refused
+# here, before any endpoint is created, so the home is untouched.
+if [ "$KIND" = secondmate ] && [ "$HARNESS_NAMED" = 1 ] \
+   && ! harness_supports_secondmate "$HARNESS"; then
+  echo "error: harness '$HARNESS' is verified for crewmates and scouts only, not for secondmate launches; select a secondmate-verified adapter ($FM_SECONDMATE_HARNESSES)" >&2
+  exit 1
+fi
 
 # pi-signed is an explicitly selected executable identity, not an alias that may
 # silently fall back to pi. Resolve it from PATH before creating an endpoint and
@@ -961,7 +1019,7 @@ model_flag_for_harness() {
   local harness=$1 model=$2
   [ -n "$model" ] && [ "$model" != default ] || return 0
   case "$harness" in
-    claude|codex|opencode|pi|pi-signed|grok|kimi)
+    claude|codex|opencode|pi|pi-signed|grok|kimi|agy)
       printf -- '--model %s ' "$(shell_quote "$model")"
       ;;
   esac
@@ -998,6 +1056,14 @@ effort_flag_for_harness() {
       # its --thinking flag.
       case "$effort" in
         low|medium|high|xhigh|max) printf -- '--thinking %s ' "$(shell_quote "$effort")" ;;
+      esac
+      ;;
+    agy)
+      # agy 1.1.10 documents --effort as low|medium|high, so the ceiling is high;
+      # xhigh and max are omitted rather than passed as known-bad values, the same
+      # policy grok's lower ceiling uses.
+      case "$effort" in
+        low|medium|high) printf -- '--effort %s ' "$(shell_quote "$effort")" ;;
       esac
       ;;
     # opencode's interactive `opencode --prompt` launch has a verified --model
@@ -1771,8 +1837,10 @@ if [ "$KIND" != secondmate ]; then
   # submitted turn, so the seed record is busy/fm-spawn. The minted gen is
   # embedded into each adapter's wiring so an event from a superseded
   # incarnation is rejected as stale. Grok stays on its isolated rendered-tail
-  # fallback and standalone Kimi stays unknown until fm_busy_kimi_verified
-  # opens, so neither is armed here.
+  # fallback, standalone Kimi stays unknown until fm_busy_kimi_verified opens,
+  # and agy has no verified semantic source at all, so none of the three is
+  # armed here. Arming without wiring would seed a busy record nothing could
+  # ever clear.
   BUSY_GEN=
   case "$HARNESS" in
     codex*)

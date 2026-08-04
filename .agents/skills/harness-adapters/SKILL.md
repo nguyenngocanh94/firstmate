@@ -1,6 +1,6 @@
 ---
 name: harness-adapters
-description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, pi-signed, grok, and kimi.
+description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, pi-signed, grok, kimi, and agy.
 user-invocable: false
 metadata:
   internal: true
@@ -15,6 +15,10 @@ Optional dispatch profiles in `config/crew-dispatch.json` can override that stat
 When a matched rule or default is a profile array, load `quota-array-dispatch` for the completion-aware candidate choice after this skill establishes harness and model/provider facts.
 The captain may override that file at session start or later; a per-task instruction such as "run this one on codex" overrides it for that dispatch only.
 `default` means mirror firstmate's own harness.
+
+One adapter, `agy`, is verified for crewmates and scouts only.
+Dispatch it exactly like any other verified adapter for task work, and never route a secondmate to it: `fm-spawn` refuses a named `agy` secondmate spawn before it creates an endpoint, so the persistent home is never touched.
+The agy section below owns the reason and what verifying that path would take.
 
 Secondmates have their own harness knob, so a secondmate can run on a different adapter than crewmates.
 `config/secondmate-harness` is the harness the primary uses to launch SECONDMATE agents, resolved through the fallback chain `config/secondmate-harness` -> `config/crew-harness` -> firstmate's own.
@@ -58,6 +62,7 @@ The primary integrations for `claude`, `codex`, `opencode`, `pi`, `pi-signed`, a
 `opencode`, `pi`, and `pi-signed` expose passive lifecycle callbacks and force one bounded follow-up when the shared predicate blocks.
 Grok selects native blocking or its pre-native bounded resume fallback from the exact running Stop payload; [`docs/turnend-guard.md`](../../../docs/turnend-guard.md) owns that contract.
 Kimi is outside the primary turn-end guard scope, while `docs/turnend-guard.md` owns its separate guarded global hook for crew wake signals.
+agy is outside that scope too, and unlike Kimi it has no verified crew wake hook either; it is a crewmate adapter only, and a firstmate that detects itself on agy receives the `unknown` supervision protocol.
 The exact hook files, commands, scoping rules, and fail-open tradeoffs are owned by `docs/turnend-guard.md`.
 `docs/verification/supervision.md` "Turn-end guard" owns active validation evidence.
 When changing any primary turn-end hook, validate the real harness behavior in a scratch project or throwaway home before trusting it, then update that doc and the relevant concise fact below.
@@ -127,6 +132,7 @@ The supported launch-profile flags below are verified locally; each row records 
 | pi / pi-signed | `--model <model>` | `--thinking <low\|medium\|high\|xhigh\|max>` | Verified 2026-07-27 on Pi and pi-signed 0.82.0. Both expose the same accepted thinking levels and completed the same model-qualified max-thinking smoke. |
 | opencode | `--model <provider/model>` | none for firstmate's interactive launch | Verified on opencode 1.17.6. `opencode run` has `--variant`, but firstmate launches the interactive `opencode --prompt` path, which has no verified effort flag. |
 | kimi | `--model <model>` | none | Verified 2026-07-25 on Kimi Code CLI 0.29.1. |
+| agy | `--model <model>` | `--effort <low\|medium\|high>` | Verified 2026-08-04 on agy 1.1.10. `--effort` documents exactly `low|medium|high`, so the ceiling is `high` and both `xhigh` and `max` are omitted rather than passed, the same policy grok's lower ceiling uses. |
 
 The concrete `harness` field owns adapter identity independently of the model provider: `harness=pi` with `model=xai/grok-*` is Pi using xAI, not `harness=grok`, and does not require Grok CLI login; `harness=grok` remains the standalone Grok Build CLI adapter.
 No script resolves that split for you: establish which credential store a tuple reads from the discovery surfaces below plus `quota-axi auth --json`'s per-provider sources, and show that reasoning rather than inferring it from a harness, model, or source name.
@@ -144,6 +150,7 @@ Use the discovery surface in the current authenticated environment because suppo
 | pi / pi-signed | Run the selected executable as `<executable> --list-models [search]`; Pi's installed `docs/models.md` owns how built-in, extension-registered, and custom provider/model entries reach that list. |
 | grok | Run `grok models`, which lists the models available to the current Grok installation and account. |
 | kimi | Run `kimi provider list --json`, which lists the current provider and model configuration. |
+| agy | Run `agy models`, which lists the models available to the current Antigravity installation and account. |
 
 For an unfamiliar harness or model namespace, establish support and provider identity from that harness's authoritative CLI help, model listing, or current documentation rather than guessing from a name or prefix.
 A listing that reaches the account and does not contain the model is concrete evidence the model is unsupported: block that candidate and quote the result.
@@ -397,3 +404,47 @@ The delivery-only spinner match covers the full moon-phase glyph set rather than
 Each Kimi crew worktree receives a gitignored `.fm-kimi-turnend` token pointer, and the global hook touches that task's `state/<id>.turn-ended` only when the Stop payload's `cwd`, pointer, and registry entry all agree.
 A guarded silent hook cannot be verified from absence of effect, so prove invocation with an unguarded probe before concluding that the hook did not fire.
 The guarded turn-end signal remains a wake notification; standalone Kimi has no busy-state source until one is live-verified.
+
+## agy (VERIFIED 2026-08-04, agy 1.1.10; CREWMATE AND SCOUT ONLY)
+
+Antigravity CLI (`agy`), a Google DeepMind coding CLI.
+Launch with the brief as an initial interactive prompt: `agy --dangerously-skip-permissions -i "$(cat <brief>)"`.
+`-i` / `--prompt-interactive` runs that prompt and then stays interactive, which is the supervised shape firstmate needs; a bare `--print` run would exit at the end of one turn.
+For agy's supported reasoning-effort values and omission behavior, see the [launch-profile-axes table](#launch-profile-axes).
+
+| Fact | Value |
+|---|---|
+| Binary | `agy` from `PATH` (installed at `~/.local/bin/agy` on the verification machine). |
+| Busy state | None. agy has no verified semantic source and gets no rendered-text fallback, so every agy task classifies `unknown missing` and is never "provably working". Its rendered footer serves delivery guards only. |
+| Exit command | `/exit` exits immediately and prints `Resume with -c (or command below): agy --conversation=<id>`. |
+| Interrupt | single Escape, which cancels the turn and shows `Interrupted · What should Antigravity CLI do instead?`. |
+| Skill invocation | `/<skill>`, for example `/no-mistakes`. `/exit` submitted cleanly through `fm-send`'s retry path; treat the claude-family slash-popup settle hazards as applying until an argument-taking command is verified. |
+| Autonomy | `--dangerously-skip-permissions` auto-approves every tool permission request, the equivalent of claude's flag of the same name. Verified: the crewmate runs a full task end to end unattended. |
+| Env marker | `ANTIGRAVITY_AGENT=1`, set for child processes alongside `ANTIGRAVITY_CONVERSATION_ID` and `ANTIGRAVITY_LS_VERSION=cli-1.1.10`. agy sets no Claude-compatible marker. |
+| Resume | `agy --conversation=<id>` (id printed on exit), or `agy -c` / `--continue` for the most recent conversation. Verified to retain full context, including headlessly under `-p`. |
+| Composer | Bordered box with a bare `>` prompt glyph, already covered by the shared composer classifier with no override. |
+| Trust dialog | First run per directory: "Do you trust the contents of this project?" with "Yes, I trust this folder" preselected. Accept with Enter. |
+| Secondmates | Not verified. `fm-spawn` refuses a named agy secondmate spawn before creating an endpoint. |
+
+**The trust dialog appears even in a fresh pooled worktree**, unlike codex's per-repo-root decision, so peek every agy pane within about 20 seconds of spawn and accept it with `FM_HOME=<this-firstmate-home> bin/fm-send.sh <window> --key Enter`, then confirm the brief started processing.
+
+**Idle feedback overlay (quirk).**
+After some turns an idle feedback prompt appears above the composer: `How's the CLI experience so far?` followed by `[1] Good [2] Fine [3] Bad [0] Skip`.
+It is presentation chrome, not a permission gate, a trust prompt, or a dialog that blocks work, so never answer it with a numeric keystroke as part of routine supervision and never read it as a worker needing a decision.
+It carries no busy token, so it does not make the pane read busy, and while it renders above the composer the shared reader still proves that composer empty, so injection and submit acknowledgement are unaffected.
+If a future agy release ever draws it over the composer instead, the reader reports the composer unreadable and firstmate defers rather than typing into the overlay, which is the safe direction.
+Regression coverage: `tests/fm-agy-harness.test.sh`.
+
+**No turn-end hook (recorded gap).**
+agy tasks are supervised by stale-pane detection alone: no per-turn wake marker is touched, and no semantic busy record is ever written, so an agy task classifies `unknown missing` and any stale pane surfaces to firstmate instead of being absorbed as provably working.
+`fm-spawn` deliberately arms no busy contract for agy, because arming without a writer would seed a busy record nothing could clear.
+The surface exists but did not verify: agy documents a `Stop` lifecycle hook, and on 1.1.10 a workspace `hooks.json` was not loaded at all, so nothing fired and nothing could be trusted.
+`docs/verification/supervision.md` "Semantic busy state" owns the dated probe, its exact commands and output, and what closing the gap requires.
+The one boundary worth repeating here: the untried candidate is a captain-owned global vendor config that already holds the captain's own hook entries, so proposing that install needs the captain's word rather than a silent write.
+A guarded silent hook also cannot be verified from absence of effect, so any future attempt must prove invocation with an unguarded probe first.
+
+**Crewmate-only, and why.**
+A secondmate is a different contract from a crewmate: a persistent home, an idle-by-default charter, and marked routed replies rather than one supervised task in a disposable worktree.
+None of that is verified on agy, and an idle secondmate pane is exactly the case where the missing turn-end signal and absent busy source matter most, so `fm-spawn` refuses a named agy secondmate spawn - locally and on the remote route - before any endpoint is created.
+The raw-launch escape hatch stays available, because that is how the secondmate path would be verified.
+`agy` is also matched EXACTLY everywhere firstmate identifies a harness process, never as a substring, because it is a fragment of ordinary command names such as `legacy` and `magyar`; a loose match would classify unrelated processes as live agents.

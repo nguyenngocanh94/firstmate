@@ -54,6 +54,11 @@ Observed identities, and the resulting verdict:
 | pi-signed | 0.82.0 | `pi-launcher` | `pi-signed`, `pi` | alive |
 | grok | 0.2.118 | `grok-0.2.118-ma` | `grok` | alive |
 | kimi | 0.31.1 | `kimi` | `kimi` | alive |
+| agy | 1.1.10 | `agy` | `/Users/…/.local/bin/agy` | alive |
+
+The agy row was added on 2026-08-04 from the same guard, when that adapter was first verified; every other row is from the 2026-08-03 run.
+That 2026-08-04 run also observed `node` as the `#{pane_current_command}` title for codex, opencode, and pi in an install environment where each resolves through a Node launcher, while their foreground `comm` still carried the identifying path and all three still classified `alive`.
+Two independent name sources are what makes that difference harmless, and it is further evidence that the title field is an install- and release-dependent surface rather than a contract.
 
 Claude Code is the harness whose title no longer attributes it at all; every other adapter is currently attributed by both sources.
 Codex reported `codex-aarch64-a` at 0.145.0 and `codex` at 0.146.0, and Kimi Code reported `kimi-code` as its foreground `comm` at 0.29.1 and `kimi` at 0.31.1, so these identities move between ordinary patch releases in both directions.
@@ -76,6 +81,13 @@ Bounded output from the run that produced the table:
 ok - harness liveness: claude 2.1.220 (Claude Code) classifies alive
 # claude 2.1.220 (Claude Code): title='2.1.220' foreground=[claude ]
 # checked 7 installed harness(es)
+```
+
+Bounded output from the 2026-08-04 run that added the agy row:
+
+```text
+# agy 1.1.10: title='agy' foreground=[/Users/erics/.local/bin/agy ]
+ok - harness liveness: agy 1.1.10 classifies alive
 ```
 
 Installed-wrapper checks:

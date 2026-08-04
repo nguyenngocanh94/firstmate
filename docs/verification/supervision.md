@@ -73,6 +73,7 @@ Each pass polled `state/<id>.busy-state` while a real turn ran.
 | Codex | codex-cli 0.145.0 | None usable | See below; classifies `unknown codex-unverified`. |
 | Kimi (standalone) | not installed | None usable | No binary on `PATH`, so the gate stays closed and it classifies `unknown kimi-unverified`. |
 | Grok | 0.2.112 | Isolated rendered-tail fallback | Retained unconverted; the approved audit could not credit a live structured-lifecycle run. |
+| agy | 1.1.10 | None usable | Probed 2026-08-04; see below. No semantic source and no turn-end hook, so it classifies `unknown missing` and `fm-spawn` arms no busy contract for it. |
 
 Codex was probed two ways, both refused:
 
@@ -86,12 +87,31 @@ Firstmate-written project hooks under `<worktree>/.codex/hooks.json` fired for n
 Codex also exposes no `StopFailure` hook, so an API-error turn end would need separate coverage even after hook discovery works.
 The app-server protocol schema does define the required lifecycle (`turn/started`, plus a `turn/completed` status of `completed`, `interrupted`, `failed`, or `inProgress`), so the gate is a reachability problem rather than a protocol gap.
 
+agy 1.1.10 documents lifecycle hooks in a `hooks.json` under a customization root, including a `Stop` event that fires when the execution loop terminates, which is the right shape for a per-task turn-end touch.
+The workspace-local locations were probed on 2026-08-04 in a git-initialized scratch workspace, with the same handler placed first at `<workspace>/.agents/hooks.json` and then at `<workspace>/.gemini/hooks.json`:
+
+```sh
+agy --dangerously-skip-permissions --log-file /tmp/agy-hook.log -p 'Reply with exactly: pong' --print-timeout 3m
+grep -i 'named hooks' /tmp/agy-hook.log
+```
+
+The run completed normally and printed `pong`, the `Stop` handler never executed, and the log recorded the same result for both locations:
+
+```text
+hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+```
+
+So nothing was loaded and nothing could be trusted.
+The remaining candidate is the machine-global customization root `~/.gemini/config/`, which is a captain-owned vendor config surface that already carries the captain's own hook entries; installing firstmate's hook there is the same class of decision as Grok's global hook and was not attempted without the captain's word.
+Closing the gap requires establishing which root the installed version loads, proving a `Stop` handler fires for a firstmate-launched worker with an unguarded probe, then landing the per-task pointer and registry wiring in `fm-spawn` together with the busy-source gate in `bin/fm-busy-lib.sh`.
+
 Deterministic entry points:
 
 ```sh
 tests/fm-busy-state.test.sh
 tests/fm-busy-adapter-wiring.test.sh
 tests/fm-crew-state.test.sh
+tests/fm-agy-harness.test.sh
 ```
 
 ## Turn-end guard
