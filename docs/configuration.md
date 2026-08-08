@@ -160,6 +160,18 @@ An inherited `data/captain-shared.md` counts in a secondmate's total but remains
 The internal `/stow` skill curates only the editable local files in that case and reports the primary-owned shared file as a concrete exception if it alone exceeds the budget.
 The helper's header owns exact parsing, publication, and report output mechanics.
 
+## Token burn monitoring (config/token-budget / data/token-usage/)
+
+`bin/fm-token-usage.sh` is the deterministic read-only Claude token-burn reader: it attributes every Claude session log under `~/.claude/projects` to a fleet source (primary, mate, task, pipeline, unattributed, or other) and prints per-source-per-model usage with API-equivalent cost.
+The script header and its `--help` own the exact flags, attribution rule, and cost table; the captain-facing daily read is `bin/fm-token-usage.sh --window 24`.
+The local, gitignored `config/token-budget` file holds the early-warning budget: one line `<budget-tokens> <window-hours> [warn-percent]`, with `#` starting a comment and warn-percent defaulting to 80.
+An absent config file means monitoring only: `--check` never wakes without a budget to compare against, and a malformed config prints one diagnostic line instead of silently disabling the warning.
+`bin/fm-token-budget-arm.sh <id>` generates and registers the watcher early-warning check through the existing `bin/fm-check-register.sh` trust mechanism; the registered check re-reads the config on every poll, so changing the budget needs no re-arm.
+The check prints exactly one line when usage is at or above the warn percent of the budget, or when the last-hour rate linearly projected over the window would exceed it; the line names the top source so the wake is actionable.
+`--board-line` prints one short line such as `🔥 24h: 412M (pipeline 61%)` for the captain board; the caller updates the board, the script only prints.
+`--daily-log` writes the previous local day's per-source summary to `data/token-usage/<YYYY-MM-DD>.json` under the effective home when absent, and prunes files older than 30 days; that is the only write the tool ever performs.
+The reader requires jq and touches no network; `FM_CLAUDE_PROJECTS`, `FM_HOME`, and the standard state/data/config overrides point tests at fixtures.
+
 ## Secondmate routes (data/secondmates.md)
 
 Persistent secondmate routes live locally in `data/secondmates.md`.
