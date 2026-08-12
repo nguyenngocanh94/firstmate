@@ -18,6 +18,12 @@
 #   other:<encoded-dir> everything else (captain's out-of-fleet Claude sessions)
 # A session dir is matched by encoding a known root with the Claude Code rule
 # (each "/" and "." becomes "-") and comparing prefixes at a "-" boundary.
+# Every root is encoded under each name of its location (as recorded and
+# physically resolved, per bin/fm-path-identity-lib.sh), because a session dir
+# was encoded from whichever name that session's working directory carried: a
+# symlinked ancestor otherwise drops a whole mate home or task worktree into
+# other:<encoded-dir>. Session dirs are encoded strings, not paths, so a name no
+# root was recorded under cannot be resolved back and stays unattributed.
 #
 # Usage:
 #   fm-token-usage.sh [--json] [--window <hours>] [--since <ISO8601>] [-h|--help]
@@ -90,6 +96,8 @@ FM_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 FM_DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 FM_CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 CLAUDE_PROJECTS="${FM_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
+# shellcheck source=bin/fm-path-identity-lib.sh
+. "$SCRIPT_DIR/fm-path-identity-lib.sh"
 
 MODE=table
 FORMAT=toon
@@ -273,9 +281,18 @@ FM_TOKEN_ROOTS=
 FM_TOKEN_TASKS=
 FM_TOKEN_ROOTS_SORTED=
 
-fm_token_root_add() {  # <real-path> <label>
+# fm_token_root_add <path> <label>: register one attribution root under EVERY
+# name of its location, so a session dir encoded from the recorded name and one
+# encoded from the physically resolved name both attribute to <label>.
+fm_token_root_add() {  # <path> <label>
+  local candidate
   [ -n "$1" ] || return 0
-  FM_TOKEN_ROOTS="${FM_TOKEN_ROOTS}$(fm_token_encode "$1")"$'\t'"$2"$'\n'
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    FM_TOKEN_ROOTS="${FM_TOKEN_ROOTS}$(fm_token_encode "$candidate")"$'\t'"$2"$'\n'
+  done <<EOF
+$(fm_path_identity_candidates "$1")
+EOF
 }
 
 fm_token_task_add() {  # <id> <worktree> <pr> <meta-home>

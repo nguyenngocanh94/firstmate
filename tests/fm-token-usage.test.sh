@@ -315,4 +315,104 @@ FM_HOME="$ARM_HOME" FM_CONFIG_OVERRIDE="$ARM_HOME/config" "$ARM" arm-test >/dev/
 expect_code 1 $? "arm refuses a malformed config"
 pass "fm-token-budget-arm.sh generates and registers the watcher check"
 
+# --- attribution across a symlinked ancestor ------------------------------------
+#
+# Records and session dirs do not agree on which name a location has: a mate home
+# comes from data/secondmates.md, which holds the name the operator registered,
+# while a task worktree comes from state/<id>.meta, recorded from a terminal's
+# physically resolved cwd. A session dir is encoded from whichever name that
+# session's working directory carried. When a pool root moves behind a symlink the
+# two disagree, and before the fix every such mate home and task worktree fell
+# into other:<encoded-dir> - the live fleet lost two whole mate homes that way.
+#
+# The fixture gives one directory tree two absolute names and covers every
+# combination that can actually occur: a root recorded under the logical name
+# with its session encoded from the physical one (the live loss - a registry
+# entry written before the move, sessions opened after it), a root recorded
+# logically with a logically-encoded session (the pre-move pairing, which must
+# not regress), and a root recorded physically with a physically-encoded session
+# (the post-move pairing).
+#
+# The remaining combination - a root recorded physically whose session was
+# encoded logically - is deliberately absent, because a session dir is an encoded
+# string and a name no root was recorded under cannot be resolved back to one. It
+# also cannot arise: a physically recorded root was written after the move, so
+# its own sessions are encoded physically too.
+
+# Resolved first, because macOS puts the temp root itself behind a symlink
+# (/var -> /private/var): the fixture's own symlink must be the only aliased
+# component, or "physical" below would be a second alias.
+SYM_ROOT="$TMP_ROOT/symlinked"
+mkdir -p "$SYM_ROOT"
+SYM_ROOT=$(cd "$SYM_ROOT" && pwd -P)
+SYM_PHYS="$SYM_ROOT/phys"
+mkdir -p "$SYM_PHYS/pool/mate-home/data" "$SYM_PHYS/pool/mate-home/state" \
+  "$SYM_PHYS/pool/task-wt"
+ln -s phys "$SYM_ROOT/link"
+SYM_LINK="$SYM_ROOT/link"
+
+SYM_HOME="$TMP_ROOT/sym-fm-home"
+SYM_USER_HOME="$TMP_ROOT/sym-user-home"
+SYM_PROJECTS="$TMP_ROOT/sym-projects"
+mkdir -p "$SYM_HOME/config" "$SYM_HOME/data" "$SYM_HOME/state"
+
+# Registered under the LOGICAL name; its session dir encoded from the PHYSICAL one.
+cat > "$SYM_HOME/data/secondmates.md" <<EOF
+- symmate - symlinked second mate (home: $SYM_LINK/pool/mate-home; scope: test; projects: none; added 2026-01-01)
+EOF
+session_line "$SYM_PROJECTS/$(enc "$SYM_PHYS/pool/mate-home")/m1.jsonl" \
+  "$(iso_from_epoch $((NOW - 600)))" claude-opus-4 111 0 0 0
+
+# Recorded under the LOGICAL name with a logically encoded session: the pre-move
+# pairing, which adding the extra candidate must not break.
+cat > "$SYM_HOME/state/sym-logical.meta" <<EOF
+worktree=$SYM_LINK/pool/task-wt
+kind=ship
+EOF
+session_line "$SYM_PROJECTS/$(enc "$SYM_LINK/pool/task-wt")/t1.jsonl" \
+  "$(iso_from_epoch $((NOW - 700)))" claude-opus-4 222 0 0 0
+
+# Recorded under the PHYSICAL name with a physically encoded session: the
+# post-move pairing every current spawn produces.
+mkdir -p "$SYM_PHYS/pool/task-wt-2"
+cat > "$SYM_HOME/state/sym-physical.meta" <<EOF
+worktree=$SYM_PHYS/pool/task-wt-2
+kind=ship
+EOF
+session_line "$SYM_PROJECTS/$(enc "$SYM_PHYS/pool/task-wt-2")/t2.jsonl" \
+  "$(iso_from_epoch $((NOW - 750)))" claude-opus-4 444 0 0 0
+
+SYM_MODEL=$(FM_HOME="$SYM_HOME" FM_STATE_OVERRIDE="$SYM_HOME/state" \
+  FM_DATA_OVERRIDE="$SYM_HOME/data" FM_CONFIG_OVERRIDE="$SYM_HOME/config" \
+  HOME="$SYM_USER_HOME" FM_CLAUDE_PROJECTS="$SYM_PROJECTS" \
+  "$READER" --json --window 24)
+
+sym_tokens() {  # <source> -> tokens for that source, 0 when absent
+  printf '%s\n' "$SYM_MODEL" |
+    jq -r --arg s "$1" '(.source_totals[] | select(.source == $s) | .tokens) // 0' | head -1
+}
+
+[ "$(sym_tokens mate:symmate)" = 111 ] \
+  || fail "logically registered mate home with a physically encoded session: want 111 tokens on mate:symmate, got $(sym_tokens mate:symmate)"
+[ "$(sym_tokens task:sym-logical)" = 222 ] \
+  || fail "logically recorded worktree with a logically encoded session: want 222 tokens, got $(sym_tokens task:sym-logical)"
+[ "$(sym_tokens task:sym-physical)" = 444 ] \
+  || fail "physically recorded worktree with a physically encoded session: want 444 tokens, got $(sym_tokens task:sym-physical)"
+OTHERS=$(printf '%s\n' "$SYM_MODEL" | jq -r '.source_totals[].source | select(startswith("other:"))')
+[ -z "$OTHERS" ] \
+  || fail "symlinked roots must not fall into other:, got: $(printf '%s' "$OTHERS" | tr '\n' ' ')"
+pass "a root recorded under either name attributes its sessions instead of falling into other:"
+
+# The tolerance must not turn unrelated sessions into fleet attribution: a dir
+# that is nobody's root is still other:<encoded-dir>.
+session_line "$SYM_PROJECTS/$(enc "$SYM_PHYS/pool/not-a-root")/x1.jsonl" \
+  "$(iso_from_epoch $((NOW - 800)))" claude-opus-4 333 0 0 0
+SYM_MODEL=$(FM_HOME="$SYM_HOME" FM_STATE_OVERRIDE="$SYM_HOME/state" \
+  FM_DATA_OVERRIDE="$SYM_HOME/data" FM_CONFIG_OVERRIDE="$SYM_HOME/config" \
+  HOME="$SYM_USER_HOME" FM_CLAUDE_PROJECTS="$SYM_PROJECTS" \
+  "$READER" --json --window 24)
+[ "$(sym_tokens "other:$(enc "$SYM_PHYS/pool/not-a-root")")" = 333 ] \
+  || fail "an unrelated session dir must stay other:<encoded-dir>"
+pass "a session dir under no known root is still attributed to other:<encoded-dir>"
+
 printf 'ok - all fm-token-usage behavior tests passed\n'

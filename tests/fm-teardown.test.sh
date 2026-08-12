@@ -198,13 +198,15 @@ SH
   chmod +x "$case_dir/fakebin/tasks-axi"
 }
 
-# Write a meta file for the task. Args: case_dir mode kind
+# Write a meta file for the task. Args: case_dir mode kind [worktree]
+# The worktree defaults to the case's own path; pass another NAME OF THE SAME
+# worktree to reproduce a record written under a different name for it.
 write_meta() {
-  local case_dir=$1 mode=$2 kind=$3
+  local case_dir=$1 mode=$2 kind=$3 worktree=${4:-$1/wt}
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=firstmate:fm-task-x1" \
     "endpoint_task_id=task-x1" \
-    "worktree=$case_dir/wt" \
+    "worktree=$worktree" \
     "project=$case_dir/project" \
     "kind=$kind" \
     "mode=$mode"
@@ -443,6 +445,46 @@ fi
 exit 0
 SH
   chmod +x "$case_dir/fakebin/treehouse"
+}
+
+# Give the case dir a second absolute name through a sibling symlink, so the task
+# worktree has both a physical name ("$case_dir/wt") and a logical one
+# ("$alias/wt"). This is the shape of the storage move that broke teardown: the
+# pool root became a symlink, so records written before and after the move name
+# the same directory differently. Echoes the alias dir.
+symlink_alias_for_case() {  # <case-dir>
+  local case_dir=$1 alias_dir="$1-alias"
+  ln -sfn "$case_dir" "$alias_dir"
+  printf '%s\n' "$alias_dir"
+}
+
+# Override fakebin/treehouse with a stub that keys its pool registry on ONE
+# literal path string, the way the real CLI does: `return` succeeds only for that
+# exact name and otherwise reports "is not managed by treehouse", and `status`
+# prints that name so it can be recovered. Every invocation is logged to
+# $case_dir/treehouse.log.
+add_literal_name_treehouse() {  # <case-dir> <registered-name>
+  local case_dir=$1 registered=$2
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$case_dir/treehouse.log"
+case "\${1:-}" in
+  status) printf '1     available    %s\n' "$registered"; exit 0 ;;
+  return)
+    shift
+    [ "\${1:-}" = --force ] && shift
+    if [ "\${1:-}" = "$registered" ]; then
+      echo "Worktree returned to pool."
+      exit 0
+    fi
+    echo "worktree \${1:-} is not managed by treehouse" >&2
+    exit 1
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+  : > "$case_dir/treehouse.log"
 }
 
 git_index_lock_path() {
@@ -2475,6 +2517,98 @@ EOF
   pass "the run abort and the leaked-process reap both complete before the destructive worktree return"
 }
 
+# (z) The live incident: the worktree is recorded under its physically resolved
+# name while treehouse registered the logical one. Teardown used to abort here
+# with "not managed by treehouse", leaving a finished task looking live.
+test_recorded_physical_name_tears_down_against_logical_registration() {
+  local case_dir alias_dir rc
+  case_dir=$(make_case symlink-recorded-physical)
+  alias_dir=$(symlink_alias_for_case "$case_dir")
+  write_meta "$case_dir" no-mistakes ship "$case_dir/wt"
+  add_literal_name_treehouse "$case_dir" "$alias_dir/wt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "symlink-recorded-physical: teardown should succeed against the logical registration"
+  assert_grep "$alias_dir/wt" "$case_dir/treehouse.log" \
+    "symlink-recorded-physical: the registered name was never tried"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "symlink-recorded-physical: task state must be cleared after a successful return"
+  pass "a worktree recorded under its physical name is returned against a logical registration"
+}
+
+# (aa) The other direction: the worktree is recorded under the logical name while
+# treehouse registered the physical one.
+test_recorded_logical_name_tears_down_against_physical_registration() {
+  local case_dir alias_dir wt_real rc
+  case_dir=$(make_case symlink-recorded-logical)
+  alias_dir=$(symlink_alias_for_case "$case_dir")
+  wt_real=$(cd "$case_dir/wt" && pwd -P)
+  write_meta "$case_dir" no-mistakes ship "$alias_dir/wt"
+  add_literal_name_treehouse "$case_dir" "$wt_real"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "symlink-recorded-logical: teardown should succeed against the physical registration"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "symlink-recorded-logical: task state must be cleared after a successful return"
+  pass "a worktree recorded under a logical name is returned against a physical registration"
+}
+
+# (ab) The refusal direction the fix must not weaken: when treehouse recognizes
+# NO name of the recorded worktree, teardown still aborts and keeps task state.
+test_unknown_worktree_still_aborts_teardown() {
+  local case_dir rc
+  case_dir=$(make_case symlink-unknown-worktree)
+  write_meta "$case_dir" no-mistakes ship "$case_dir/wt"
+  add_literal_name_treehouse "$case_dir" "$case_dir/some-other-pool-slot"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "symlink-unknown-worktree: teardown must abort when no name is managed"
+  assert_grep "treehouse return failed for worktree" "$case_dir/stderr" \
+    "symlink-unknown-worktree: teardown did not report the failed return"
+  assert_grep "not managed by treehouse" "$case_dir/stderr" \
+    "symlink-unknown-worktree: teardown did not surface treehouse's own diagnosis"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "symlink-unknown-worktree: task state must survive an aborted teardown"
+  pass "a worktree treehouse manages under no name still aborts teardown with its state intact"
+}
+
+# The alias tolerance must not reach past the landed-work gate: unlanded work in a
+# worktree named through the symlink is still refused before any return runs.
+test_symlinked_name_still_refuses_unlanded_work() {
+  local case_dir alias_dir rc
+  case_dir=$(make_case symlink-unlanded-refuses)
+  alias_dir=$(symlink_alias_for_case "$case_dir")
+  write_meta "$case_dir" local-only ship "$alias_dir/wt"
+  wt_commit "$case_dir" "unlanded work"
+  add_literal_name_treehouse "$case_dir" "$alias_dir/wt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "symlink-unlanded-refuses: teardown must refuse unlanded work"
+  assert_grep REFUSED "$case_dir/stderr" \
+    "symlink-unlanded-refuses: teardown did not refuse unlanded work"
+  [ ! -s "$case_dir/treehouse.log" ] \
+    || fail "symlink-unlanded-refuses: no return may run for refused work: $(cat "$case_dir/treehouse.log")"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "symlink-unlanded-refuses: task state must survive a refusal"
+  pass "unlanded work in a worktree named through a symlink is still refused before any return"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -2531,3 +2665,7 @@ test_process_spawned_during_grace_is_reaped_on_later_pass
 test_persistent_scan_refuses_after_bounded_retries
 test_process_exit_during_identity_lookup_does_not_refuse
 test_run_abort_precedes_process_reap_precedes_worktree_removal
+test_recorded_physical_name_tears_down_against_logical_registration
+test_recorded_logical_name_tears_down_against_physical_registration
+test_unknown_worktree_still_aborts_teardown
+test_symlinked_name_still_refuses_unlanded_work
