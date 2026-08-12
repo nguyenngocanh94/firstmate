@@ -161,9 +161,13 @@ That shared mapping registers every attribution root under **each name of its lo
 This is load-bearing rather than defensive: a symlinked pool root gives one directory two absolute names, and a Claude session directory is encoded from whichever name that session's working directory carried.
 Registering one name only would drop a whole secondmate home or task worktree into `other:<encoded-dir>`.
 
-The two do **not** currently agree on totals.
-`fm-token-usage.sh` sums usage per log record, which the requestId finding above shows double-counts Claude tokens; the ledger counts one usage per model call.
-That difference is known and deliberate to leave in place here, because correcting the fleet reader changes the captain's live budget-alarm thresholds and belongs in its own change rather than inside a measurement baseline.
+The two now also share the requestId call-grouping itself, via [`bin/fm-token-dedup-lib.sh`](../bin/fm-token-dedup-lib.sh): `fm-token-usage.sh` groups Claude log records into calls exactly the way the ledger does, so the two agree on token totals for the same log.
+`fm-token-usage.sh` additionally reports `total_calls`, `naive_log_record_count` and `duplicate_usage_records` at the top level of its output, mirroring the ledger's `calls`/`naive_log_record_count` pair, so the size of that correction stays visible.
+
+**Any `data/token-usage/*.json` daily snapshot written before this grouping landed was computed by the old per-log-record sum and is inflated.**
+The inflation ratio is not constant: it depends on how many content blocks each session's responses happened to have, so it varies per session and does not cancel out in a fleet aggregate (measured 1.68x on the real fleet's last 24h of Claude usage on 2026-08-12: 600,483,593 naive tokens versus 357,635,568 deduped tokens over the same window, 1,583 real calls versus 2,744 raw log records).
+`data/token-reports/` is unaffected: it comes from the ledger, which has grouped by requestId since it was introduced.
+Old daily snapshots are never rewritten automatically; do not compare them against a total produced after this change without accounting for the inflation.
 
 ## Maintaining this file
 

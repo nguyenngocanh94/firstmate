@@ -81,6 +81,17 @@
 # Session count is per session FILE: one session per file that contributed at
 # least one usage line in the selected range, per source/model rollup.
 #
+# ONE MODEL CALL == ONE requestId, NOT one log record - see
+# bin/fm-token-dedup-lib.sh (claude_call_groups), which this reader shares with
+# bin/fm-token-ledger.sh so the two never disagree on what one call is. Every
+# token bucket above is summed per call, once. total_calls, plus the
+# naive_log_record_count and duplicate_usage_records diagnostics, are reported
+# alongside so the size of that correction stays visible. See
+# docs/token-baseline.md "Relationship to the fleet reader": any
+# data/token-usage/<date>.json daily snapshot written before this dedup landed
+# was computed by the old per-log-record sum and is inflated; it is not
+# comparable to a total produced after this change.
+#
 # Environment overrides (tests and unusual setups):
 #   FM_HOME / FM_ROOT_OVERRIDE   home and code root resolution (standard)
 #   FM_STATE_OVERRIDE            state dir (worktree= metas)
@@ -107,6 +118,12 @@ CLAUDE_PROJECTS="${FM_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
 # shellcheck source=bin/fm-token-attrib-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-token-attrib-lib.sh"
+# claude_call_groups: the requestId call-grouping jq filter, shared with
+# bin/fm-token-ledger.sh so the two readers can never disagree on what one
+# model call is. See that library for the full contract.
+# shellcheck source=bin/fm-token-dedup-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-token-dedup-lib.sh"
 
 MODE=table
 FORMAT=toon
@@ -219,27 +236,35 @@ fm_token_human_m() {
 
 # --- scan + aggregate ----------------------------------------------------------
 
-# fm_token_scan_dir <encoded-dir> <source>: one compact JSON record per usage
-# line: {source, file, ts (epoch), model, output_tokens,
-# cache_creation_input_tokens, cache_read_input_tokens, input_tokens}.
-# Unparseable lines are skipped (stderr suppressed); a corrupt file yields the
-# records parsed before the error, never a hard failure.
+# fm_token_scan_dir <encoded-dir> <source>: one compact JSON record per MODEL
+# CALL: {source, file, ts (epoch), model, output_tokens,
+# cache_creation_input_tokens, cache_read_input_tokens, input_tokens,
+# log_records (naive per-record count this call collapsed)}. Records are
+# grouped by requestId through the shared claude_call_groups filter
+# (bin/fm-token-dedup-lib.sh) before their usage is read, so a single API
+# response written as several log records is counted once. A record with no
+# requestId is never merged with another and is still counted (its own
+# one-record group). Unparseable lines are skipped (stderr suppressed); a
+# corrupt file yields the calls parsed before the error, never a hard failure.
 fm_token_scan_dir() {
   local dir=$1 source=$2 f
   for f in "$CLAUDE_PROJECTS/$dir"/*.jsonl; do
     [ -f "$f" ] || continue
-    jq -c -r --arg source "$source" --arg file "$(basename "$f")" '
-      select(.message.usage != null and .timestamp != null)
+    jq -c . "$f" 2>/dev/null | jq -s -c --arg source "$source" --arg file "$(basename "$f")" \
+      "$FM_TOKEN_CLAUDE_CALL_GROUPS_JQ"'
+      claude_call_groups[]
+      | select(.timestamp != "unknown")
       | (.timestamp | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $ts
       | {source: $source, file: $file, ts: $ts,
-         model: (.message.model // "unknown"),
-         output_tokens: (.message.usage.output_tokens // 0),
-         cache_creation_input_tokens: (.message.usage.cache_creation_input_tokens // 0),
-         cache_read_input_tokens: (.message.usage.cache_read_input_tokens // 0),
-         input_tokens: (.message.usage.input_tokens // 0)}
+         model: .model,
+         output_tokens: (.usage.output_tokens // 0),
+         cache_creation_input_tokens: (.usage.cache_creation_input_tokens // 0),
+         cache_read_input_tokens: (.usage.cache_read_input_tokens // 0),
+         input_tokens: (.usage.input_tokens // 0),
+         log_records: .records}
       | select(.output_tokens + .cache_creation_input_tokens
                + .cache_read_input_tokens + .input_tokens > 0)
-    ' "$f" 2>/dev/null
+    '
   done
 }
 
@@ -280,6 +305,10 @@ EOF
         since: $since_label,
         claude_projects: $projects,
         total_sessions: ($recs | map(.file) | unique | length),
+        total_calls: ($recs | length),
+        naive_log_record_count: ($recs | map(.log_records) | add // 0),
+        duplicate_usage_records: (($recs | map(.log_records) | add // 0) - ($recs | length)),
+        naive_log_record_note: "Claude writes one log record per content block of a single API response, each repeating the SAME usage. total_calls counts distinct model calls (grouped by requestId, see bin/fm-token-dedup-lib.sh); naive_log_record_count sums raw per-record log lines, which double-counts tokens. Both are reported so the difference stays visible.",
         total_tokens: ($recs | map(tokens_of) | add // 0),
         total_output_tokens: ($recs | map(.output_tokens) | add // 0),
         total_cache_creation_input_tokens: ($recs | map(.cache_creation_input_tokens) | add // 0),
