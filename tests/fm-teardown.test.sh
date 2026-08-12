@@ -2674,8 +2674,10 @@ test_token_report_hang_never_delays_teardown() {
     "token-report-hangs: cleanup must still remove the task metadata"
   [ "$elapsed" -lt 60 ] \
     || fail "token-report-hangs: cleanup took ${elapsed}s; a wedged reporter must be bounded, not merely eventually-finishing"
-  # Release any reader still parked on the FIFO so the fixture teardown is clean.
-  : > "$case_dir/hang-projects/$encoded/wedged.jsonl" 2>/dev/null || true
+  # Unlink the FIFO rather than writing to it: with its reader killed by the
+  # timeout there is no reader left, and opening a FIFO for write blocks until
+  # one appears - which would wedge this test instead of the thing it measures.
+  rm -f "$case_dir/hang-projects/$encoded/wedged.jsonl"
   pass "a hanging token baseline report is bounded and never delays cleanup"
 }
 

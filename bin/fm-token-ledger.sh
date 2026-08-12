@@ -34,7 +34,7 @@
 #                                 (totalTokens == inputTokens+outputTokens held).
 #                                 TURN granularity - see granularity below.
 # Applying the Claude formula to Codex numbers, or the Codex formula to Claude
-# numbers, produces nonsense. tests/fm-token-ledger.test.sh pins that.
+# numbers, produces nonsense. tests/fm-token-baseline.test.sh pins that.
 #
 # granularity: "call" or "turn".
 #   call  one record == one model call (claude, pi, codex).
@@ -242,6 +242,10 @@ fm_ledger_capabilities() {
 PHASE_TOOL_DISCOVERY='^(read|grep|glob|notebookread|webfetch|websearch|toolsearch|explore|listmcpresources|readmcpresource)$'
 PHASE_TOOL_IMPLEMENTATION='^(edit|multiedit|write|notebookedit|applypatch|str_replace_editor)$'
 PHASE_TOOL_SUPERVISION='^(agent|task|taskcreate|taskupdate|tasklist|taskget|taskoutput|taskstop|sendmessage|listagents|monitor|todowrite|askuserquestion|reportfindings)$'
+# Shell-running tools, whose command content is classified instead of their name.
+# Observed names per runtime: claude "Bash"/"BashOutput", pi "bash", codex "exec"
+# (its input is a JS snippet string that embeds the real command).
+PHASE_TOOL_SHELL='^(bash|bashoutput|shell|local_shell|exec|exec_command|container\.exec|run_terminal_cmd|execute_command)$'
 # Bash content patterns, evaluated in this order. VALIDATION precedes
 # SUPERVISION on purpose: bin/fm-lint.sh and bin/fm-test-run.sh are firstmate
 # scripts but they are validation, not fleet operation.
@@ -271,7 +275,9 @@ phase_confidence
      IMPLEMENTATION  $PHASE_TOOL_IMPLEMENTATION
      SUPERVISION     $PHASE_TOOL_SUPERVISION
    An unlisted tool name falls through to UNKNOWN with confidence low.
-4. Bash/shell tool rules (confidence medium), first match wins IN THIS ORDER:
+4. Shell-running tools are classified by their COMMAND CONTENT, not their name:
+     shell tools     $PHASE_TOOL_SHELL
+   Bash/shell rules (confidence medium), first match wins IN THIS ORDER:
      VALIDATION      $PHASE_BASH_VALIDATION
      SUPERVISION     $PHASE_BASH_SUPERVISION
      IMPLEMENTATION  $PHASE_BASH_IMPLEMENTATION
@@ -412,13 +418,21 @@ def bash_phase($cmd):
   elif ($cmd | test($PB_IMPLEMENTATION)) then ["IMPLEMENTATION","medium"]
   elif ($cmd | test($PB_DISCOVERY)) then ["DISCOVERY","medium"]
   else ["UNKNOWN","low"] end;
+# cmd_text: the shell text to classify, from whatever shape a runtime uses for
+# tool input. Claude passes an object with .command; codex passes a STRING (a JS
+# snippet wrapping the real command), so indexing it would raise an error rather
+# than fall through - hence the type guard before any field access.
+def cmd_text($input):
+  if ($input | type) == "string" then $input
+  elif ($input | type) == "object" then ($input.command // $input.cmd // ($input | tostring))
+  else ($input | tostring) end;
 # classify_one: one requested tool -> [phase, confidence].
 def classify_one($name; $input):
   if $name == null then ["UNKNOWN","low"]
   else (tool_phase($name)) as $byname
     | if $byname != null then $byname
-      elif (($name|lc) | test("^(bash|shell|run_terminal_cmd|execute_command|bashoutput)$"))
-      then bash_phase($input.command // $input.cmd // ($input|tostring))
+      elif (($name|lc) | test($PT_SHELL))
+      then bash_phase(cmd_text($input))
       else ["UNKNOWN","low"] end
   end;
 # classify: the whole call. Rules 1 and 2 of --phase-rules.
@@ -910,6 +924,7 @@ fm_ledger_parse() {
     --arg PT_DISCOVERY "$PHASE_TOOL_DISCOVERY" \
     --arg PT_IMPLEMENTATION "$PHASE_TOOL_IMPLEMENTATION" \
     --arg PT_SUPERVISION "$PHASE_TOOL_SUPERVISION" \
+    --arg PT_SHELL "$PHASE_TOOL_SHELL" \
     --arg PB_VALIDATION "$PHASE_BASH_VALIDATION" \
     --arg PB_SUPERVISION "$PHASE_BASH_SUPERVISION" \
     --arg PB_IMPLEMENTATION "$PHASE_BASH_IMPLEMENTATION" \
