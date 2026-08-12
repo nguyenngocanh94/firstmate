@@ -455,4 +455,194 @@ else
   echo "skip: reference session logs not present on this host"
 fi
 
+# --- 11. --task resolution across non-claude runtimes --------------------
+#
+# bin/fm-token-ledger.sh maps a task id to its session log(s) via
+# state/<id>.meta (worktree= plus harness=). This is untested elsewhere, so
+# these cases cover pi and grok's cwd-encoded directories and codex's
+# day-partitioned cwd scan, all against synthesized fixtures.
+
+write_task_meta() {  # <state-dir> <id> <harness> <worktree>
+  mkdir -p "$1"
+  printf 'harness=%s\nworktree=%s\n' "$3" "$4" > "$1/$2.meta"
+}
+
+TASK_HOME="$TMP_ROOT/task-resolve"
+TASK_STATE="$TASK_HOME/state"
+mkdir -p "$TASK_STATE"
+
+# pi: ~/.pi/agent/sessions/-<encoded-cwd>-/<ts>_<id>.jsonl
+PI_ROOT="$TMP_ROOT/pi-sessions"
+PI_WT="/fixture/pi-task-wt"
+PI_ENCODED=$(printf '%s' "$PI_WT" | tr '/.' '--')
+mkdir -p "$PI_ROOT/-$PI_ENCODED-"
+jq -cn '{type:"session", id:"pisess1"}' > "$PI_ROOT/-$PI_ENCODED-/2026-08-12T00-00-00_pisess1.jsonl"
+jq -cn '{type:"message", timestamp:"2026-08-12T06:00:00.000Z",
+  message:{model:"pi-model", content:[],
+    usage:{input:10, cacheRead:5, cacheWrite:0, output:20, reasoning:0, totalTokens:35}}}' \
+  >> "$PI_ROOT/-$PI_ENCODED-/2026-08-12T00-00-00_pisess1.jsonl"
+write_task_meta "$TASK_STATE" pi-task pi "$PI_WT"
+PIJ=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_PI_SESSIONS="$PI_ROOT" \
+  "$LEDGER" --task pi-task --json 2>&1) || fail "pi --task resolution failed: $PIJ"
+[ "$(printf '%s' "$PIJ" | jq 'length')" = 1 ] \
+  || fail "pi --task resolution: want 1 call from the matching cwd-encoded directory, got $(printf '%s' "$PIJ" | jq 'length')"
+[ "$(printf '%s' "$PIJ" | jq -r '.[0].harness')" = pi ] \
+  || fail "pi --task resolution: resolved call must declare harness pi"
+
+# grok: ~/.grok/sessions/<url-encoded-cwd>/<session-id>/updates.jsonl
+GROK_ROOT="$TMP_ROOT/grok-sessions"
+GROK_WT="/fixture/grok-task-wt"
+GROK_ENCODED=$(jq -nr --arg v "$GROK_WT" '$v|@uri')
+mkdir -p "$GROK_ROOT/$GROK_ENCODED/groksess1"
+jq -cn '{timestamp:"2026-08-12T06:00:00.000Z", method:"session/update",
+  params:{sessionId:"groksess1", update:{sessionUpdate:"usage", prompt_id:"gp1",
+    usage:{inputTokens:1000, outputTokens:100, totalTokens:1100,
+      cachedReadTokens:400, reasoningTokens:0, modelCalls:2}}}}' \
+  > "$GROK_ROOT/$GROK_ENCODED/groksess1/updates.jsonl"
+write_task_meta "$TASK_STATE" grok-task grok "$GROK_WT"
+GROKJ=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_GROK_SESSIONS="$GROK_ROOT" \
+  "$LEDGER" --task grok-task --json 2>&1) || fail "grok --task resolution failed: $GROKJ"
+[ "$(printf '%s' "$GROKJ" | jq 'length')" = 1 ] \
+  || fail "grok --task resolution: want 1 turn record from the matching url-encoded directory, got $(printf '%s' "$GROKJ" | jq 'length')"
+[ "$(printf '%s' "$GROKJ" | jq '.[0].model_calls')" = 2 ] \
+  || fail "grok --task resolution: model_calls must be the exact logged count"
+pass "pi and grok --task resolution match the documented cwd-encoding rules"
+
+# codex: no cwd-encoded directory - resolution scans day-partitioned rollouts'
+# session_meta.cwd. Three rollouts: one with the target cwd inside the lookback
+# window, one with a DIFFERENT cwd in the same window (must not match), and one
+# with the target cwd but OUTSIDE the lookback window (must not match either -
+# proves the bound is real, not decorative).
+CODEX_ROOT="$TMP_ROOT/codex-sessions"
+CODEX_WT="/fixture/codex-task-wt"
+mkdir -p "$CODEX_ROOT/2026/08/12" "$CODEX_ROOT/2026/08/11" "$CODEX_ROOT/2020/01/01"
+jq -cn --arg cwd "$CODEX_WT" '{type:"session_meta", timestamp:"2026-08-12T06:00:00.000Z",
+  payload:{id:"codexsess-match", cwd:$cwd}}' \
+  > "$CODEX_ROOT/2026/08/12/rollout-2026-08-12T06-00-00-codexsess-match.jsonl"
+jq -cn '{payload:{type:"token_count", info:{last_token_usage:{input_tokens:500, cached_input_tokens:100,
+  cache_write_input_tokens:0, output_tokens:50, reasoning_output_tokens:0, total_tokens:550},
+  total_token_usage:{total_tokens:550}}}}' \
+  >> "$CODEX_ROOT/2026/08/12/rollout-2026-08-12T06-00-00-codexsess-match.jsonl"
+jq -cn '{type:"session_meta", timestamp:"2026-08-11T06:00:00.000Z",
+  payload:{id:"codexsess-other", cwd:"/fixture/some-other-wt"}}' \
+  > "$CODEX_ROOT/2026/08/11/rollout-2026-08-11T06-00-00-codexsess-other.jsonl"
+jq -cn --arg cwd "$CODEX_WT" '{type:"session_meta", timestamp:"2020-01-01T06:00:00.000Z",
+  payload:{id:"codexsess-stale", cwd:$cwd}}' \
+  > "$CODEX_ROOT/2020/01/01/rollout-2020-01-01T06-00-00-codexsess-stale.jsonl"
+write_task_meta "$TASK_STATE" codex-task codex "$CODEX_WT"
+CODEXJ=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_ROOT" \
+  "$LEDGER" --task codex-task --json 2>&1) || fail "codex --task resolution failed: $CODEXJ"
+[ "$(printf '%s' "$CODEXJ" | jq 'length')" = 1 ] \
+  || fail "codex --task resolution: want exactly the one matching rollout's call, got $(printf '%s' "$CODEXJ" | jq 'length') ($CODEXJ)"
+[ "$(printf '%s' "$CODEXJ" | jq -r '.[0].session_id')" = codexsess-match ] \
+  || fail "codex --task resolution: resolved the wrong session"
+pass "codex --task resolution finds the exact cwd match and excludes the 2020 rollout outside the lookback window"
+
+# The 2020 rollout matches on cwd but sits far outside any reasonable lookback:
+# forcing a 1-day window must make the resolvable-today match disappear too,
+# proving the day-partition bound is load-bearing rather than always wide enough
+# by coincidence.
+CODEXERR=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_ROOT" FM_CODEX_LOOKBACK_DAYS=0 \
+  "$LEDGER" --task codex-task --json 2>&1 1>/dev/null)
+[ -n "$CODEXERR" ] \
+  || fail "codex --task resolution: a zero-day lookback must fail to resolve rather than silently scanning everything"
+
+# --- 12. unmapped runtimes name the SPECIFIC reason, not a generic phrase ----
+#
+# A future reader must be able to tell "not supported yet" (agy has no log
+# surface at all; an unrecognised harness has no resolvable location) from
+# "something broke" (codex IS resolvable, but no session matched this task).
+
+write_task_meta "$TASK_STATE" agy-task agy /fixture/agy-wt
+AGY_ERR=$(FM_STATE_OVERRIDE="$TASK_STATE" "$LEDGER" --task agy-task --json 2>&1 1>/dev/null)
+printf '%s\n' "$AGY_ERR" | grep -qF 'agy: no log surface exists' \
+  || fail "agy must name its specific unsupported reason (no log surface exists), got: $AGY_ERR"
+
+write_task_meta "$TASK_STATE" unknown-task made-up-harness /fixture/unknown-wt
+UNKNOWN_ERR=$(FM_STATE_OVERRIDE="$TASK_STATE" "$LEDGER" --task unknown-task --json 2>&1 1>/dev/null)
+printf '%s\n' "$UNKNOWN_ERR" | grep -qF 'made-up-harness: unsupported for --task resolution' \
+  || fail "an unrecognised harness must name itself as unsupported, got: $UNKNOWN_ERR"
+
+write_task_meta "$TASK_STATE" codex-nomatch codex /fixture/never-ran-anywhere
+CODEX_NOMATCH_ERR=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_ROOT" \
+  "$LEDGER" --task codex-nomatch --json 2>&1 1>/dev/null)
+printf '%s\n' "$CODEX_NOMATCH_ERR" | grep -qF 'codex: no session log matches worktree' \
+  || fail "an unmatched but mappable codex task must say no session matched, not a generic failure, got: $CODEX_NOMATCH_ERR"
+
+[ "$AGY_ERR" != "$UNKNOWN_ERR" ] && [ "$AGY_ERR" != "$CODEX_NOMATCH_ERR" ] && [ "$UNKNOWN_ERR" != "$CODEX_NOMATCH_ERR" ] \
+  || fail "the three unmapped-runtime reasons must be textually distinct: agy=[$AGY_ERR] unknown=[$UNKNOWN_ERR] codex=[$CODEX_NOMATCH_ERR]"
+
+# The report wrapper must fold the ledger's specific reason into its own
+# message rather than only ever saying the generic "could not be produced".
+REPORT_ERR=$(FM_STATE_OVERRIDE="$TASK_STATE" "$REPORT" --task agy-task 2>&1 1>/dev/null)
+printf '%s\n' "$REPORT_ERR" | grep -qF 'agy: no log surface exists' \
+  || fail "fm-token-report.sh must surface the ledger's specific per-runtime reason, got: $REPORT_ERR"
+pass "unmapped runtimes report a specific, distinct reason instead of a generic failure"
+
+# --- 13. a genuinely real codex session, cross-checked against its own totals -
+#
+# Read-only against this fleet's own real codex history (never copied into a
+# committed fixture). Self-skips when no such session exists on this host, so
+# the suite stays runnable anywhere. The cross-check is self-verifying rather
+# than a pinned number: it recomputes the runtime's own running total from the
+# SAME file at test time, so it never rots as the log grows or rotates away.
+#
+# Discovery is bounded to the REAL_LOOKBACK most recent day-partitions (kept
+# small and applied identically to the actual --task call below): a treehouse
+# pool slot's absolute path is reused across many unrelated tasks over its
+# lifetime, so scanning this fleet's FULL codex history for a first cwd match
+# can land on a path with months of unrelated historical sessions - real
+# fan-out, not a bug, but wrong for a fast, deterministic test. A recent
+# window keeps the match set to the sessions that actually share this task.
+REAL_LOOKBACK=5
+REAL_CODEX_ROOT="$HOME/.codex/sessions"
+REAL_CODEX_LOG=
+if [ -d "$REAL_CODEX_ROOT" ]; then
+  REAL_DAY_DIRS=$(find "$REAL_CODEX_ROOT" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort -r | head -n "$REAL_LOOKBACK")
+  if [ -n "$REAL_DAY_DIRS" ]; then
+    REAL_DAY_ARR=()
+    while IFS= read -r d; do [ -n "$d" ] && REAL_DAY_ARR+=("$d"); done <<EOF
+$REAL_DAY_DIRS
+EOF
+    REAL_FIRSTLINES="$TMP_ROOT/real-codex-firstlines.txt"
+    # shellcheck disable=SC2016 # single-quoted intentionally: FILENAME and $0 are awk's own variables, not the shell's
+    find "${REAL_DAY_ARR[@]}" -maxdepth 1 -name 'rollout-*.jsonl' -print0 2>/dev/null \
+      | xargs -0 awk 'FNR==1{print FILENAME "\t" $0; nextfile}' > "$REAL_FIRSTLINES" 2>/dev/null
+    REAL_CODEX_LOG=$(jq -R -r 'split("\t") | select(length == 2)
+        | select((.[1] | fromjson? | .type) == "session_meta")
+        | select((.[1] | fromjson? | .payload.cwd // "") != "")
+        | .[0]' "$REAL_FIRSTLINES" 2>/dev/null | head -1)
+  fi
+fi
+if [ -n "${REAL_CODEX_LOG:-}" ] && [ -f "$REAL_CODEX_LOG" ]; then
+  REAL_WT=$(head -1 "$REAL_CODEX_LOG" | jq -r '.payload.cwd')
+  REAL_ID=$(basename "$REAL_CODEX_LOG" | sed -n 's/.*-\([0-9a-f-]\{36\}\)\.jsonl$/\1/p')
+  REAL_STATE="$TMP_ROOT/real-codex-state"
+  write_task_meta "$REAL_STATE" real-codex-task codex "$REAL_WT"
+  REAL_MATCH_COUNT=$(FM_STATE_OVERRIDE="$REAL_STATE" FM_CODEX_LOOKBACK_DAYS="$REAL_LOOKBACK" \
+    "$LEDGER" --task real-codex-task --json 2>/dev/null | jq '[.[].session_id] | unique | length')
+  if [ "${REAL_MATCH_COUNT:-0}" != 1 ]; then
+    # The exact-total cross-check below reads ONE file's own running total, so
+    # it only applies when exactly one session matched; more than one (a
+    # reused pool slot, still within this narrow window) is skipped rather
+    # than approximated.
+    echo "skip: the discovered worktree ($REAL_WT) has $REAL_MATCH_COUNT distinct codex sessions in the last $REAL_LOOKBACK day-partitions, not exactly 1 - skipping the single-file cross-check"
+  else
+    REAL_REPORT_ERR="$TMP_ROOT/real-codex-err.txt"
+    REAL_REPORT=$(FM_STATE_OVERRIDE="$REAL_STATE" FM_CODEX_LOOKBACK_DAYS="$REAL_LOOKBACK" \
+      "$REPORT" --task real-codex-task --stdout 2>"$REAL_REPORT_ERR") \
+      || { cat "$REAL_REPORT_ERR" >&2; fail "real codex session: report generation failed for $REAL_CODEX_LOG"; }
+    REAL_SESSIONS=$(printf '%s' "$REAL_REPORT" | jq -r '.identity.sessions[]')
+    printf '%s\n' "$REAL_SESSIONS" | grep -qF "$REAL_ID" \
+      || fail "real codex session: report did not resolve the expected rollout (id $REAL_ID), sessions were: $REAL_SESSIONS"
+    RUNTIME_TOTAL=$(jq -s '[.[] | select((.payload.type // "")=="token_count")] | last | .payload.info.total_token_usage.total_tokens' "$REAL_CODEX_LOG")
+    REPORT_GROSS=$(printf '%s' "$REAL_REPORT" | jq '.totals.gross_tokens')
+    [ "$REPORT_GROSS" = "$RUNTIME_TOTAL" ] \
+      || fail "real codex session: report gross_tokens ($REPORT_GROSS) must equal the runtime's own running total ($RUNTIME_TOTAL)"
+    pass "a real codex session resolves by --task and its gross_tokens matches the runtime's own reported total exactly"
+  fi
+else
+  echo "skip: no real codex session log with a session_meta.cwd found in the last $REAL_LOOKBACK day-partitions on this host"
+fi
+
 printf 'ok - all fm-token-baseline behavior tests passed\n'

@@ -2823,6 +2823,39 @@ test_token_report_hang_never_delays_teardown() {
   pass "a hanging token baseline report is bounded and never delays cleanup"
 }
 
+# Codex has no cwd-encoded session directory (bin/fm-token-ledger.sh scans
+# day-partitioned rollouts by session_meta.cwd instead - see
+# fm_ledger_resolve_codex_task). An empty codex session root is a real,
+# genuine failure of that new path, not a stub, and the fail-open guarantee
+# must hold for it exactly as it does for the claude path above.
+test_token_report_codex_unmapped_never_blocks_teardown() {
+  local case_dir rc
+  case_dir=$(make_case token-report-codex-unmapped)
+  write_meta "$case_dir" local-only ship
+  printf 'harness=codex\n' >> "$case_dir/state/task-x1.meta"
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  mkdir -p "$case_dir/empty-codex-sessions"
+
+  set +e
+  FM_CODEX_SESSIONS="$case_dir/empty-codex-sessions" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "token-report-codex-unmapped: cleanup must succeed when codex resolution fails"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "token-report-codex-unmapped: cleanup must still remove the task metadata"
+  assert_grep "token baseline report skipped" "$case_dir/stderr" \
+    "token-report-codex-unmapped: the skip must be reported on stderr, not silently swallowed"
+  assert_grep "codex: no session day-partitions" "$case_dir/stderr" \
+    "token-report-codex-unmapped: the specific codex reason must reach the skip note, not a generic message"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "token-report-codex-unmapped: an unmapped codex session must not turn into a teardown refusal"
+  pass "an unmapped codex session never blocks or alters cleanup, and names the specific reason"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -2888,3 +2921,4 @@ test_leased_worktree_still_aborts_teardown
 test_symlinked_name_still_refuses_unlanded_work
 test_token_report_failure_never_blocks_teardown
 test_token_report_hang_never_delays_teardown
+test_token_report_codex_unmapped_never_blocks_teardown

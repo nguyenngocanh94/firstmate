@@ -116,7 +116,8 @@ esac
 # --- ledger acquisition -------------------------------------------------------
 
 LEDGER_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-token-report.XXXXXX") || die "cannot create a temp file"
-trap 'rm -f "$LEDGER_TMP" "$LEDGER_TMP.out"' EXIT INT TERM
+LEDGER_ERR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-token-report-err.XXXXXX") || die "cannot create a temp file"
+trap 'rm -f "$LEDGER_TMP" "$LEDGER_TMP.out" "$LEDGER_ERR_TMP"' EXIT INT TERM
 
 if [ -n "$LEDGER" ]; then
   if [ "$LEDGER" = - ]; then
@@ -131,10 +132,16 @@ else
   [ -n "$HARNESS" ] && LEDGER_ARGS+=(--harness "$HARNESS")
   for s in "${SESSIONS[@]+"${SESSIONS[@]}"}"; do LEDGER_ARGS+=(--session "$s"); done
   [ "${#LEDGER_ARGS[@]}" -gt 0 ] || die "need --ledger, --session or --task to obtain a ledger"
-  "$SCRIPT_DIR/fm-token-ledger.sh" "${LEDGER_ARGS[@]}" > "$LEDGER_TMP" || {
-    warn "the ledger could not be produced for $REPORT_ID"
+  if ! "$SCRIPT_DIR/fm-token-ledger.sh" "${LEDGER_ARGS[@]}" > "$LEDGER_TMP" 2> "$LEDGER_ERR_TMP"; then
+    # The ledger's own diagnostics already name the harness and the exact
+    # reason (unsupported runtime vs a supported one whose specific session
+    # could not be found); fold the LAST such line into the summary so a
+    # reader never sees only the generic "could not be produced" phrase.
+    cat "$LEDGER_ERR_TMP" >&2
+    reason=$(tail -1 "$LEDGER_ERR_TMP" | sed 's/^fm-token-ledger: //')
+    warn "the ledger could not be produced for $REPORT_ID${reason:+: $reason}"
     exit 1
-  }
+  fi
 fi
 
 [ -s "$LEDGER_TMP" ] || die "the ledger for $REPORT_ID is empty; nothing to report"
