@@ -103,6 +103,12 @@ GROK_SESSIONS="${FM_GROK_SESSIONS:-$HOME/.grok/sessions}"
 # shellcheck source=bin/fm-token-attrib-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-token-attrib-lib.sh"
+# claude_call_groups: the requestId call-grouping jq filter, shared with
+# bin/fm-token-usage.sh so the two readers can never disagree on what one
+# model call is. See that library for the full contract.
+# shellcheck source=bin/fm-token-dedup-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-token-dedup-lib.sh"
 
 warn() { printf 'fm-token-ledger: %s\n' "$*" >&2; }
 die() { warn "$*"; exit 2; }
@@ -451,29 +457,15 @@ JQ
 
 # --- claude parser ------------------------------------------------------------
 #
-# ONE MODEL CALL == ONE requestId, NOT one assistant record.
+# ONE MODEL CALL == ONE requestId, NOT one assistant record - see
+# bin/fm-token-dedup-lib.sh (claude_call_groups) for why and for the exact
+# grouping contract this parser's Pass 2 delegates to. Measured evidence for
+# both reference sessions lives in docs/verification/token-baseline.md.
 #
-# Claude Code writes one assistant record per CONTENT BLOCK of a single API
-# response, and every record of that response repeats the SAME usage object.
-# Measured on 2026-08-12 (docs/verification/token-baseline.md):
-#   dockerize-app-stack   373 assistant records -> 182 distinct requestIds
-#   fm-treehouse-path-identity  279 records -> 185 distinct requestIds
-# Within every group the usage object was byte-identical (unique length 1), each
-# group's records were contiguous in log order, and each group held at most 2
-# tool_use blocks - exactly the shape of one API response (thinking + text +
-# tool_use). Summing usage per assistant record therefore DOUBLE-COUNTS tokens
-# by roughly 2x.
-#
-# This parser groups contiguous assistant records by requestId, takes the usage
-# ONCE per group, and unions the tool_use blocks of the group. It also reports
-# duplicate_usage_records (records beyond the first in each group) so the
-# difference from a naive per-record sum is always visible and provable rather
-# than a silent correction.
-#
-# A record with NO requestId cannot be grouped. Rather than guess, each such
-# record is treated as its own call and counted in
-# ungrouped_records_no_request_id, so a log shape that breaks the grouping key
-# is reported instead of silently mis-summed.
+# This parser also reports duplicate_usage_records (records beyond the first
+# in each group) and ungrouped_records_no_request_id, so the difference from a
+# naive per-record sum is always visible and provable rather than a silent
+# correction.
 #
 # usage.iterations is additionally asserted to have length 1 (true on every
 # record of both reference sessions). A record that breaks it is emitted with
@@ -504,60 +496,11 @@ def result_index($all):
         });
 
 result_index(.) as $res
-# Pass 2: GROUP contiguous assistant records into model calls by requestId, and
-# capture the compaction boundary and context injections that landed before each
-# group opened. Log order is exact, so this needs no inference.
-| ( reduce .[] as $rec (
-      { groups: [], cur: null, pending_compaction: null, pending_injections: [] };
-      if ($rec.type == "system" and $rec.subtype == "compact_boundary") then
-        .pending_compaction = {
-          kind: "compaction",
-          trigger: ($rec.compactMetadata.trigger // "unknown"),
-          pre_tokens: (if ($rec.compactMetadata.preTokens | type) == "number" then $rec.compactMetadata.preTokens else "unknown" end),
-          post_tokens: (if ($rec.compactMetadata.postTokens | type) == "number" then $rec.compactMetadata.postTokens else "unknown" end),
-          dropped_tokens: (if ($rec.compactMetadata.cumulativeDroppedTokens | type) == "number" then $rec.compactMetadata.cumulativeDroppedTokens else "unknown" end),
-          duration_ms: (if ($rec.compactMetadata.durationMs | type) == "number" then $rec.compactMetadata.durationMs else "unknown" end)
-        }
-      elif ($rec.type == "attachment") then
-        .pending_injections += [ ($rec.attachment.type // "unknown") ]
-      elif ($rec.type == "assistant" and ($rec.message.usage | type) == "object") then
-        ($rec.requestId) as $rid
-        | [ (if ($rec.message.content | type) == "array" then $rec.message.content[] else empty end)
-            | select(.type == "tool_use") | {name: .name, input: (.input // {})} ] as $tools
-        | if .cur != null and ($rid | type) == "string" and .cur.request_id == $rid then
-            # same API response, next content block: merge, never re-add usage
-            .cur.records += 1
-            | .cur.uuids += [ $rec.uuid ]
-            | .cur.tools += $tools
-            | .cur.usage_variants += [ ($rec.message.usage | tojson) ]
-            | .cur.injections += .pending_injections
-            | .pending_injections = []
-          else
-            (if .cur != null then .groups += [ .cur ] else . end)
-            | .cur = {
-                request_id: ($rid // null),
-                no_request_id: (($rid | type) != "string"),
-                usage: $rec.message.usage,
-                usage_variants: [ ($rec.message.usage | tojson) ],
-                records: 1,
-                uuids: [ $rec.uuid ],
-                tools: $tools,
-                timestamp: ($rec.timestamp // "unknown"),
-                model: ($rec.message.model // "unknown"),
-                effort: ($rec.effort // "unknown"),
-                session_id: ($rec.sessionId // "unknown"),
-                is_sidechain: (if ($rec.isSidechain | type) == "boolean" then $rec.isSidechain else "unknown" end),
-                compaction: .pending_compaction,
-                injections: .pending_injections
-              }
-            | .pending_compaction = null
-            | .pending_injections = []
-          end
-      else . end
-    )
-    | (if .cur != null then .groups += [ .cur ] else . end)
-    | .groups
-  ) as $groups
+# Pass 2: GROUP contiguous assistant records into model calls by requestId, via
+# the shared claude_call_groups filter (bin/fm-token-dedup-lib.sh) - the single
+# owner of that grouping so this ledger and bin/fm-token-usage.sh can never
+# disagree on what one call is.
+| claude_call_groups as $groups
 # Pass 3: stateful walk over model calls.
 | reduce $groups[] as $g (
     { calls: [], idx: 0, prev_ctx: null, prev_uuid: null, repair: false,
@@ -906,9 +849,10 @@ JQ
 # stream parser stops at the first malformed line, so the file is filtered
 # line-by-line first and the drop count is reported rather than hidden.
 fm_ledger_parse() {
-  local harness=$1 log=$2 task=$3 prog total kept dropped
+  local harness=$1 log=$2 task=$3 prog preamble total kept dropped
+  preamble=$JQ_COMMON
   case "$harness" in
-    claude) prog=$JQ_CLAUDE ;;
+    claude) prog=$JQ_CLAUDE; preamble="$JQ_COMMON $FM_TOKEN_CLAUDE_CALL_GROUPS_JQ" ;;
     pi) prog=$JQ_PI ;;
     codex) prog=$JQ_CODEX ;;
     grok) prog=$JQ_GROK ;;
@@ -930,7 +874,7 @@ fm_ledger_parse() {
     --arg PB_IMPLEMENTATION "$PHASE_BASH_IMPLEMENTATION" \
     --arg PB_DISCOVERY "$PHASE_BASH_DISCOVERY" \
     --argjson dropped_lines "$dropped" \
-    "$JQ_COMMON $prog"' | .diagnostics += {unparsed_lines: $dropped_lines, source_log: $source_log}
+    "$preamble $prog"' | .diagnostics += {unparsed_lines: $dropped_lines, source_log: $source_log}
       | .calls |= map({task_id: (if $task == "" then "unknown" else $task end), source_log: $source_log} + .)'
 }
 

@@ -4,7 +4,10 @@
 # fixture JSONL, per-deliverable backlog/artifact join, cost conversion for
 # priced models, the budget-check line emission (over / under / rate projection /
 # malformed config / no config), the board line, --since, the daily log write
-# plus 30-day pruning, and check arming through fm-check-register.sh.
+# plus 30-day pruning, check arming through fm-check-register.sh, requestId
+# call-grouping (a duplicated usage group counted once, a record with no
+# requestId still counted), and exact agreement with bin/fm-token-ledger.sh on
+# the two real reference sessions read read-only.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -12,6 +15,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 READER="$ROOT/bin/fm-token-usage.sh"
+LEDGER="$ROOT/bin/fm-token-ledger.sh"
 ARM="$ROOT/bin/fm-token-budget-arm.sh"
 TMP_ROOT=$(fm_test_tmproot fm-token)
 
@@ -146,6 +150,61 @@ crew_a_in=$(printf '%s\n' "$CREW_A" | jq -r '.input_tokens')
 crew_a_sessions=$(printf '%s\n' "$CREW_A" | jq -r '.sessions')
 [ "$crew_a_sessions" = 1 ] || fail "task:crew-a sessions: want 1 file, got $crew_a_sessions"
 pass "usage summation from fixture JSONL (output/cache create/cache read/input)"
+
+# --- requestId call-grouping: a duplicate usage group is counted once, and a
+# record with no requestId is still counted, not dropped -----------------------
+#
+# Claude writes one log record per content block of a single API response and
+# repeats the same usage object on every record of that response; summing per
+# record double-counts tokens. bin/fm-token-usage.sh must dedup exactly the way
+# bin/fm-token-ledger.sh does (bin/fm-token-dedup-lib.sh is the single owner of
+# that grouping).
+
+# claude_call <file> <requestId|""> <uuid> <ts> <model> <out> <cc> <cr> <in>:
+# one assistant LOG RECORD. Several records may share a requestId - that is
+# the real shape the grouping contract has to survive.
+claude_call() {
+  mkdir -p "$(dirname "$1")"
+  jq -cn --arg rid "$2" --arg uuid "$3" --arg ts "$4" --arg model "$5" \
+    --argjson out "$6" --argjson cc "$7" --argjson cr "$8" --argjson inp "$9" '
+    { type: "assistant", timestamp: $ts, uuid: $uuid,
+      message: { model: $model,
+        usage: { output_tokens: $out, cache_creation_input_tokens: $cc,
+                 cache_read_input_tokens: $cr, input_tokens: $inp } } }
+    + (if $rid == "" then {} else { requestId: $rid } end)
+  ' >> "$1"
+}
+
+DUP_HOME="$TMP_ROOT/dup-home"
+DUP_USER_HOME="$TMP_ROOT/dup-user-home"
+DUP_PROJECTS="$TMP_ROOT/dup-projects"
+mkdir -p "$DUP_HOME/state" "$DUP_HOME/data" "$DUP_HOME/config"
+DUP_LOG="$DUP_PROJECTS/$(enc "$DUP_HOME")/dup.jsonl"
+# One API response written as two content-block records sharing requestId r1,
+# both repeating the same usage - exactly the shape that double-counted before.
+claude_call "$DUP_LOG" r1 u1 "$(iso_from_epoch $((NOW - 300)))" claude-opus-4 50 100 1000 10
+claude_call "$DUP_LOG" r1 u2 "$(iso_from_epoch $((NOW - 300)))" claude-opus-4 50 100 1000 10
+# A record with no requestId at all: must be counted as its own call, never dropped.
+claude_call "$DUP_LOG" "" u3 "$(iso_from_epoch $((NOW - 200)))" claude-opus-4 5 0 0 1
+
+DUP_MODEL=$(FM_HOME="$DUP_HOME" FM_STATE_OVERRIDE="$DUP_HOME/state" \
+  FM_DATA_OVERRIDE="$DUP_HOME/data" FM_CONFIG_OVERRIDE="$DUP_HOME/config" \
+  HOME="$DUP_USER_HOME" FM_CLAUDE_PROJECTS="$DUP_PROJECTS" \
+  "$READER" --json --window 24)
+
+DUP_CALLS=$(printf '%s\n' "$DUP_MODEL" | jq -r '.total_calls')
+[ "$DUP_CALLS" = 2 ] || fail "requestId dedup: want 2 calls from 3 records (2 grouped + 1 ungrouped), got $DUP_CALLS"
+DUP_NAIVE=$(printf '%s\n' "$DUP_MODEL" | jq -r '.naive_log_record_count')
+[ "$DUP_NAIVE" = 3 ] || fail "naive_log_record_count must count all 3 raw log records, got $DUP_NAIVE"
+DUP_DUPES=$(printf '%s\n' "$DUP_MODEL" | jq -r '.duplicate_usage_records')
+[ "$DUP_DUPES" = 1 ] || fail "duplicate_usage_records must be records-calls=3-2=1, got $DUP_DUPES"
+DUP_CR=$(printf '%s\n' "$DUP_MODEL" | jq -r '.total_cache_read_input_tokens')
+[ "$DUP_CR" = 1000 ] \
+  || fail "cache_read must be counted once per requestId group: want 1000, got $DUP_CR (2000 means the duplicate record was summed)"
+DUP_OUT=$(printf '%s\n' "$DUP_MODEL" | jq -r '.total_output_tokens')
+[ "$DUP_OUT" = 55 ] \
+  || fail "output must sum the deduped call (50) plus the ungrouped record (5): want 55, got $DUP_OUT"
+pass "requestId dedup: a duplicated usage group is counted once, and a record with no requestId is still counted"
 
 for pair in \
   "primary claude-opus-4" \
@@ -414,5 +473,72 @@ SYM_MODEL=$(FM_HOME="$SYM_HOME" FM_STATE_OVERRIDE="$SYM_HOME/state" \
 [ "$(sym_tokens "other:$(enc "$SYM_PHYS/pool/not-a-root")")" = 333 ] \
   || fail "an unrelated session dir must stay other:<encoded-dir>"
 pass "a session dir under no known root is still attributed to other:<encoded-dir>"
+
+# --- cross-check: the reader must agree exactly with the ledger on real logs --
+#
+# The captain's own reference session logs, read read-only through a symlink
+# (never copied into a fixture). A session log GROWS while its session is
+# alive (tests/fm-token-baseline.test.sh saw this rot a pinned exact total), so
+# this does not pin a number: it asserts AGREEMENT between the two tools on
+# whatever the log currently holds, which cannot rot the same way. Both tools
+# share the same requestId grouping (bin/fm-token-dedup-lib.sh), so they must
+# always produce the same call count and the same sum for every token bucket.
+REF1="$HOME/.claude/projects/-Volumes-Work-AI--treehouse-mexcbot-b1b499-1-mexcbot/c0ac9bd6-e550-47a5-b90b-cae35cec1f78.jsonl"
+REF2="$HOME/.claude/projects/-Volumes-Work-AI--treehouse-firstmate-47172b-3-firstmate/ada84f96-4e49-4cc7-81e2-a0ca545f7dbc.jsonl"
+
+# cross_check <log> <label>: symlink <log> into an isolated projects root,
+# read it through both tools, and assert they agree on calls and every bucket.
+cross_check() {
+  local log=$1 label=$2 root ledger_diag ledger_json reader_out \
+    l_calls l_total l_naive l_cr l_cw l_in l_out \
+    r_calls r_naive r_cr r_cw r_in r_out
+  [ -f "$log" ] || { echo "skip: $label reference session not present on this host"; return 0; }
+  ledger_diag=$("$LEDGER" --session "$log" --harness claude 2>&1 >/dev/null)
+  case "$ledger_diag" in
+    *"ASSERTION BROKEN"*)
+      echo "skip: $label ledger reported a broken assertion; cross-check needs clean records"
+      return 0
+      ;;
+  esac
+  ledger_json=$("$LEDGER" --session "$log" --harness claude --json 2>/dev/null) \
+    || fail "$label: ledger failed reading the reference session"
+  l_total=$(printf '%s\n' "$ledger_json" | jq 'length')
+  l_calls=$(printf '%s\n' "$ledger_json" | jq '[.[] | select(.log_records | type == "number")] | length')
+  [ "$l_calls" = "$l_total" ] || { echo "skip: $label ledger reported a non-numeric log_records; cross-check needs clean records"; return 0; }
+
+  root="$TMP_ROOT/xcheck-$label"
+  mkdir -p "$root/projects/sess" "$root/home/state" "$root/home/data" "$root/home/config"
+  ln -sf "$log" "$root/projects/sess/ref.jsonl"
+  reader_out=$(FM_HOME="$root/home" FM_STATE_OVERRIDE="$root/home/state" \
+    FM_DATA_OVERRIDE="$root/home/data" FM_CONFIG_OVERRIDE="$root/home/config" \
+    HOME="$root/user-home" FM_CLAUDE_PROJECTS="$root/projects" \
+    "$READER" --json --window 900000)
+
+  l_naive=$(printf '%s\n' "$ledger_json" | jq '[.[].log_records] | add')
+  l_cr=$(printf '%s\n' "$ledger_json" | jq '[.[].cached_input_tokens] | add')
+  l_cw=$(printf '%s\n' "$ledger_json" | jq '[.[].cache_write_tokens] | add')
+  l_in=$(printf '%s\n' "$ledger_json" | jq '[.[].input_tokens] | add')
+  l_out=$(printf '%s\n' "$ledger_json" | jq '[.[].output_tokens] | add')
+
+  r_calls=$(printf '%s\n' "$reader_out" | jq -r '.total_calls')
+  r_naive=$(printf '%s\n' "$reader_out" | jq -r '.naive_log_record_count')
+  r_cr=$(printf '%s\n' "$reader_out" | jq -r '.total_cache_read_input_tokens')
+  r_cw=$(printf '%s\n' "$reader_out" | jq -r '.total_cache_creation_input_tokens')
+  r_in=$(printf '%s\n' "$reader_out" | jq -r '.total_input_tokens')
+  r_out=$(printf '%s\n' "$reader_out" | jq -r '.total_output_tokens')
+
+  [ "$l_calls" = "$r_calls" ] || fail "$label: ledger calls ($l_calls) != reader total_calls ($r_calls)"
+  [ "$l_naive" = "$r_naive" ] || fail "$label: ledger naive record count ($l_naive) != reader naive_log_record_count ($r_naive)"
+  [ "$l_cr" = "$r_cr" ] || fail "$label: cache_read mismatch: ledger $l_cr, reader $r_cr"
+  [ "$l_cw" = "$r_cw" ] || fail "$label: cache_write mismatch: ledger $l_cw, reader $r_cw"
+  [ "$l_in" = "$r_in" ] || fail "$label: input mismatch: ledger $l_in, reader $r_in"
+  [ "$l_out" = "$r_out" ] || fail "$label: output mismatch: ledger $l_out, reader $r_out"
+  [ "$l_naive" -gt "$l_calls" ] \
+    || fail "$label: $l_naive naive records collapsed to $l_calls calls; grouping did nothing on a real log"
+  pass "$label: reader and ledger agree exactly on calls and every token bucket"
+}
+
+cross_check "$REF1" mexcbot
+cross_check "$REF2" fm-treehouse-firstmate
 
 printf 'ok - all fm-token-usage behavior tests passed\n'
