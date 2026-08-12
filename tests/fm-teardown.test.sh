@@ -2609,6 +2609,78 @@ test_symlinked_name_still_refuses_unlanded_work() {
   pass "unlanded work in a worktree named through a symlink is still refused before any return"
 }
 
+# --- token baseline report hook: STRICTLY fail-open --------------------------
+#
+# Teardown generates the token baseline report on its last line where the task
+# metadata still exists (the session log outlives cleanup, the metadata does
+# not). Measurement must never influence cleanup, so both failure shapes are
+# pinned here: a reporter that FAILS and a reporter that HANGS. In each case
+# teardown must still succeed and still remove every durable task record.
+
+test_token_report_failure_never_blocks_teardown() {
+  local case_dir rc
+  case_dir=$(make_case token-report-fails)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  # A session-log root with no directory for this worktree: the ledger cannot
+  # resolve a log, so the reporter genuinely exits non-zero. This is a real
+  # failure path, not a stub.
+  mkdir -p "$case_dir/empty-projects"
+
+  set +e
+  FM_CLAUDE_PROJECTS="$case_dir/empty-projects" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "token-report-fails: cleanup must succeed when the reporter fails"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "token-report-fails: cleanup must still remove the task metadata"
+  assert_grep "token baseline report skipped" "$case_dir/stderr" \
+    "token-report-fails: the skip must be reported on stderr, not silently swallowed"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "token-report-fails: a failing reporter must not turn into a teardown refusal"
+  pass "a failing token baseline report never blocks or alters cleanup"
+}
+
+test_token_report_hang_never_delays_teardown() {
+  local case_dir rc encoded started elapsed
+  case_dir=$(make_case token-report-hangs)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  # A FIFO in place of the session log makes the reporter block for real when it
+  # reads it: nothing ever writes to the other end. Claude Code encodes a
+  # worktree path by turning every "/" and "." into "-".
+  encoded=$(printf '%s' "$case_dir/wt" | tr '/.' '--')
+  mkdir -p "$case_dir/hang-projects/$encoded"
+  mkfifo "$case_dir/hang-projects/$encoded/wedged.jsonl" 2>/dev/null \
+    || { echo "skip: mkfifo unavailable"; return 0; }
+
+  started=$(date +%s)
+  set +e
+  FM_CLAUDE_PROJECTS="$case_dir/hang-projects" \
+  FM_TOKEN_REPORT_TIMEOUT=2 \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  elapsed=$(( $(date +%s) - started ))
+
+  expect_code 0 "$rc" "token-report-hangs: cleanup must succeed when the reporter wedges"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "token-report-hangs: cleanup must still remove the task metadata"
+  [ "$elapsed" -lt 60 ] \
+    || fail "token-report-hangs: cleanup took ${elapsed}s; a wedged reporter must be bounded, not merely eventually-finishing"
+  # Unlink the FIFO rather than writing to it: with its reader killed by the
+  # timeout there is no reader left, and opening a FIFO for write blocks until
+  # one appears - which would wedge this test instead of the thing it measures.
+  rm -f "$case_dir/hang-projects/$encoded/wedged.jsonl"
+  pass "a hanging token baseline report is bounded and never delays cleanup"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -2669,3 +2741,5 @@ test_recorded_physical_name_tears_down_against_logical_registration
 test_recorded_logical_name_tears_down_against_physical_registration
 test_unknown_worktree_still_aborts_teardown
 test_symlinked_name_still_refuses_unlanded_work
+test_token_report_failure_never_blocks_teardown
+test_token_report_hang_never_delays_teardown

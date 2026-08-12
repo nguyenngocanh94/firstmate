@@ -313,6 +313,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/token-baseline.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/trace-context.md",
       "audience": "maintainer-architecture"
     },
@@ -342,6 +346,10 @@
     },
     {
       "path": "docs/verification/supervision.md",
+      "audience": "maintainer-verification"
+    },
+    {
+      "path": "docs/verification/token-baseline.md",
       "audience": "maintainer-verification"
     },
     {
