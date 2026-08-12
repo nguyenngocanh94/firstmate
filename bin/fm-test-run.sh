@@ -140,7 +140,7 @@ family_for_basename() {
     fm-crew-state.test.sh|fm-decision-hold-lifecycle.test.sh|\
     fm-documentation-audiences.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
     fm-kimi-harness.test.sh|fm-herdr-lab.test.sh|fm-lint.test.sh|\
-    fm-path-identity.test.sh|fm-token-usage.test.sh|\
+    fm-path-identity.test.sh|fm-token-usage.test.sh|fm-token-baseline.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
     fm-send-popup-settle.test.sh|fm-send-settle.test.sh|\
     fm-subagent-pretool-check.test.sh|\
@@ -900,8 +900,20 @@ families_for_changed_path() {
     bin/fm-gate-refuse*|bin/fm-lock*|bin/fm-quota-axi-lib.sh)
       printf '%s\n' session-bootstrap
       ;;
-    bin/fm-pr-*|bin/fm-merge-local.sh|bin/fm-teardown.sh|bin/fm-review-diff.sh|\
+    bin/fm-pr-*|bin/fm-merge-local.sh|bin/fm-review-diff.sh|\
     bin/fm-x-*|bin/fm-check*)
+      printf '%s\n' pr-forge
+      ;;
+    bin/fm-teardown.sh)
+      # Teardown owns the fail-open token baseline report hook as well as the
+      # landed-work and cleanup contracts, so it selects both families.
+      printf '%s\n' pr-forge
+      printf '%s\n' pure-contract-unit
+      ;;
+    bin/fm-token-*)
+      printf '%s\n' pure-contract-unit
+      # The report hook lives in bin/fm-teardown.sh (pr-forge), so a ledger or
+      # report change must re-run the cleanup fail-open cases too.
       printf '%s\n' pr-forge
       ;;
     bin/fm-nm-run-lib.sh)

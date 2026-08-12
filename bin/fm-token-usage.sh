@@ -24,6 +24,10 @@
 # symlinked ancestor otherwise drops a whole mate home or task worktree into
 # other:<encoded-dir>. Session dirs are encoded strings, not paths, so a name no
 # root was recorded under cannot be resolved back and stays unattributed.
+# The mapping itself - including that dual-name encoding - lives in
+# bin/fm-token-attrib-lib.sh so the per-call ledger (bin/fm-token-ledger.sh)
+# attributes a session identically; this header remains the single owner of what
+# the labels above MEAN.
 #
 # Usage:
 #   fm-token-usage.sh [--json] [--window <hours>] [--since <ISO8601>] [-h|--help]
@@ -96,8 +100,13 @@ FM_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 FM_DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 FM_CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 CLAUDE_PROJECTS="${FM_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
-# shellcheck source=bin/fm-path-identity-lib.sh
-. "$SCRIPT_DIR/fm-path-identity-lib.sh"
+# Session-to-fleet-source attribution: fm_token_encode, fm_token_iso_epoch,
+# fm_token_secondmate_homes, fm_token_scan_metas, fm_token_build_roots,
+# fm_token_attribute, fm_token_build_sources. Reads FM_HOME/FM_STATE/FM_DATA/
+# CLAUDE_PROJECTS set above.
+# shellcheck source=bin/fm-token-attrib-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-token-attrib-lib.sh"
 
 MODE=table
 FORMAT=toon
@@ -176,16 +185,6 @@ FM_TOKEN_PRICES=$(jq -n '{
 
 # --- small helpers -----------------------------------------------------------
 
-# fm_token_encode <path>: Claude Code project-dir encoding ("/" and "." -> "-").
-fm_token_encode() {
-  printf '%s' "$1" | tr '/.' '--'
-}
-
-# fm_token_iso_epoch <iso>: ISO8601 (UTC, optional fractional seconds) -> epoch.
-fm_token_iso_epoch() {
-  jq -nr --arg s "$1" '$s | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601' 2>/dev/null
-}
-
 # fm_token_date_yesterday: local yesterday as YYYY-MM-DD (macOS and GNU date).
 fm_token_date_yesterday() {
   if date -v-1d +%Y-%m-%d >/dev/null 2>&1; then
@@ -218,136 +217,6 @@ fm_token_human_m() {
   printf '%sM\n' "$(( ( $1 + 500000 ) / 1000000 ))"
 }
 
-# --- secondmate homes (data/secondmates.md) ----------------------------------
-
-# fm_token_secondmate_homes: print "id<TAB>home" per registered secondmate.
-# The routing-table suffix "(home: ...; scope: ...; projects: ...; added ...)"
-# keeps its labeled fields intact (secondmate-provisioning owns that contract);
-# home: is extracted from the final parenthesized group.
-fm_token_secondmate_homes() {
-  local line suffix id home
-  [ -f "$FM_DATA/secondmates.md" ] || return 0
-  while IFS= read -r line; do
-    case "$line" in
-      '-'*|'*'*) ;;
-      *) continue ;;
-    esac
-    suffix=$(printf '%s\n' "$line" | sed -n 's/.*(\(.*\))$/\1/p')
-    [ -n "$suffix" ] || continue
-    home=$(printf '%s\n' "$suffix" | sed -n 's/^home: \([^;]*\).*/\1/p')
-    case "$home" in
-      ''|/*) ;;
-      *) continue ;;
-    esac
-    id=${line#- }
-    id=${id%% *}
-    case "$id" in
-      ''|*[!A-Za-z0-9._-]*) continue ;;
-    esac
-    printf '%s\t%s\n' "$id" "$home"
-  done < "$FM_DATA/secondmates.md"
-}
-
-# --- worktree-to-task metas ---------------------------------------------------
-
-# fm_token_scan_metas <state-dir> <home-root>: print "id<TAB>worktree<TAB>pr<TAB>home"
-# for every non-secondmate meta with a worktree. The pr= value and the home that
-# owns the meta feed the per-deliverable join (artifact and backlog/report).
-fm_token_scan_metas() {
-  local state=$1 home=$2 meta id wt pr kind
-  [ -d "$state" ] && [ ! -L "$state" ] || return 0
-  for meta in "$state"/*.meta; do
-    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
-    id=$(basename "$meta" .meta)
-    case "$id" in
-      ''|*[!A-Za-z0-9._-]*) continue ;;
-    esac
-    kind=$(sed -n 's/^kind=//p' "$meta" | head -1)
-    [ "$kind" = secondmate ] && continue
-    wt=$(sed -n 's/^worktree=//p' "$meta" | head -1)
-    case "$wt" in
-      '') continue ;;
-      /*) ;;
-      *) continue ;;
-    esac
-    pr=$(sed -n 's/^pr=//p' "$meta" | head -1)
-    printf '%s\t%s\t%s\t%s\n' "$id" "$wt" "${pr:--}" "$home"
-  done
-}
-
-# --- attribution roots --------------------------------------------------------
-
-FM_TOKEN_ROOTS=
-FM_TOKEN_TASKS=
-FM_TOKEN_ROOTS_SORTED=
-
-# fm_token_root_add <path> <label>: register one attribution root under EVERY
-# name of its location, so a session dir encoded from the recorded name and one
-# encoded from the physically resolved name both attribute to <label>.
-fm_token_root_add() {  # <path> <label>
-  local candidate
-  [ -n "$1" ] || return 0
-  while IFS= read -r candidate; do
-    [ -n "$candidate" ] || continue
-    FM_TOKEN_ROOTS="${FM_TOKEN_ROOTS}$(fm_token_encode "$candidate")"$'\t'"$2"$'\n'
-  done <<EOF
-$(fm_path_identity_candidates "$1")
-EOF
-}
-
-fm_token_task_add() {  # <id> <worktree> <pr> <meta-home>
-  FM_TOKEN_TASKS="${FM_TOKEN_TASKS}$1"$'\t'"$2"$'\t'"$3"$'\t'"$4"$'\n'
-}
-
-# fm_token_build_roots: fill FM_TOKEN_ROOTS (encoded-root<TAB>label, sorted
-# longest-first) and FM_TOKEN_TASKS (id<TAB>worktree<TAB>pr<TAB>meta-home).
-fm_token_build_roots() {
-  local id home meta_id meta_wt meta_pr meta_home
-  FM_TOKEN_ROOTS=
-  FM_TOKEN_TASKS=
-  fm_token_root_add "$HOME/.no-mistakes" pipeline
-  fm_token_root_add "$FM_HOME" primary
-  while IFS=$'\t' read -r meta_id meta_wt meta_pr meta_home; do
-    [ -n "$meta_id" ] || continue
-    fm_token_root_add "$meta_wt" "task:$meta_id"
-    fm_token_task_add "$meta_id" "$meta_wt" "$meta_pr" "$meta_home"
-  done <<EOF
-$(fm_token_scan_metas "$FM_STATE" "$FM_HOME")
-EOF
-  while IFS=$'\t' read -r id home; do
-    [ -n "$id" ] || continue
-    fm_token_root_add "$home" "mate:$id"
-    while IFS=$'\t' read -r meta_id meta_wt meta_pr meta_home; do
-      [ -n "$meta_id" ] || continue
-      fm_token_root_add "$meta_wt" "task:$meta_id"
-      fm_token_task_add "$meta_id" "$meta_wt" "$meta_pr" "$meta_home"
-    done <<EOF
-$(fm_token_scan_metas "$home/state" "$home")
-EOF
-  done <<EOF
-$(fm_token_secondmate_homes)
-EOF
-  fm_token_root_add "$HOME/.treehouse" crew:unattributed
-  FM_TOKEN_ROOTS_SORTED=$(printf '%s\n' "$FM_TOKEN_ROOTS" |
-    awk -F '\t' '{print length($1) "\t" $0}' |
-    sort -rn -k1,1 |
-    cut -f2,3)
-}
-
-# fm_token_attribute <encoded-dir>: first matching root label, else other:<dir>.
-fm_token_attribute() {
-  local dir=$1 root label
-  while IFS=$'\t' read -r root label; do
-    [ -n "$root" ] || continue
-    case "$dir" in
-      "$root"|"$root-"*) printf '%s\n' "$label"; return 0 ;;
-    esac
-  done <<EOF
-$FM_TOKEN_ROOTS_SORTED
-EOF
-  printf 'other:%s\n' "$dir"
-}
-
 # --- scan + aggregate ----------------------------------------------------------
 
 # fm_token_scan_dir <encoded-dir> <source>: one compact JSON record per usage
@@ -371,20 +240,6 @@ fm_token_scan_dir() {
       | select(.output_tokens + .cache_creation_input_tokens
                + .cache_read_input_tokens + .input_tokens > 0)
     ' "$f" 2>/dev/null
-  done
-}
-
-# fm_token_build_sources: fill FM_TOKEN_SOURCES (encoded-dir<TAB>source) for
-# every session dir under CLAUDE_PROJECTS.
-FM_TOKEN_SOURCES=
-fm_token_build_sources() {
-  local dir d source
-  FM_TOKEN_SOURCES=
-  for dir in "$CLAUDE_PROJECTS"/*/; do
-    [ -d "$dir" ] || continue
-    d=$(basename "$dir")
-    source=$(fm_token_attribute "$d")
-    FM_TOKEN_SOURCES="${FM_TOKEN_SOURCES}${d}"$'\t'"${source}"$'\n'
   done
 }
 

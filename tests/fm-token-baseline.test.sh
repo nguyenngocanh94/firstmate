@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+# Behavior tests for the token baseline tools: bin/fm-token-ledger.sh,
+# bin/fm-token-report.sh and bin/fm-token-charts.sh.
+#
+# The two contracts these tests exist to defend:
+#
+#   1. ONE MODEL CALL == ONE requestId on Claude. Claude Code writes one log
+#      record per content block of a single API response and repeats the SAME
+#      usage object on each, so a per-record sum double-counts tokens. The
+#      grouping test is the regression guard for that.
+#   2. NEVER ESTIMATE. A telemetry field the log does not carry must surface as
+#      the literal "unknown", never as 0 and never interpolated; an unexplainable
+#      context delta must land in unattributed_* and must not be redistributed.
+#
+# Also covered: the per-runtime semantics are not interchangeable (the Claude and
+# Codex formulas produce different answers and each is applied only to its own
+# runtime), phase classification including the exact-failure precondition for
+# REWORK, compaction parsed from real boundary records with zero events reported
+# as a measured fact, turn-granularity handling for grok, the private report
+# location plus its capability declaration, and the four chart renderings.
+#
+# Fixtures are synthesised here. The captain's real session logs are only ever
+# read read-only by the optional cross-check at the end, which self-skips when
+# those logs are absent, and no real log is ever copied into a fixture.
+set -u
+
+# shellcheck source=tests/lib.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+LEDGER="$ROOT/bin/fm-token-ledger.sh"
+REPORT="$ROOT/bin/fm-token-report.sh"
+CHARTS="$ROOT/bin/fm-token-charts.sh"
+TMP_ROOT=$(fm_test_tmproot fm-token-baseline)
+
+command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
+
+# --- fixture builders ---------------------------------------------------------
+
+# claude_call <file> <requestId> <uuid> <parentUuid> <in> <cw> <cr> <out> <think>
+#             <content-json>
+# One assistant LOG RECORD. Several records may share a requestId; that is the
+# real shape the grouping contract has to survive.
+claude_call() {
+  mkdir -p "$(dirname "$1")"
+  jq -cn --arg rid "$2" --arg uuid "$3" --arg parent "$4" \
+    --argjson in "$5" --argjson cw "$6" --argjson cr "$7" \
+    --argjson out "$8" --argjson think "$9" --argjson content "${10}" \
+    --arg ts "${11:-2026-08-12T06:00:00.000Z}" '{
+      type: "assistant", timestamp: $ts, uuid: $uuid,
+      parentUuid: (if $parent == "" then null else $parent end),
+      requestId: $rid, sessionId: "sess-fixture", isSidechain: false,
+      effort: "high",
+      message: { model: "claude-opus-5", content: $content,
+        usage: { input_tokens: $in, cache_creation_input_tokens: $cw,
+                 cache_read_input_tokens: $cr, output_tokens: $out,
+                 output_tokens_details: { thinking_tokens: $think },
+                 iterations: [ { type: "message" } ] } }
+    }' >> "$1"
+}
+
+# claude_tool_result <file> <assistant-uuid> <result-json> <is_error|null>
+claude_tool_result() {
+  jq -cn --arg src "$2" --argjson res "$3" --argjson err "${4:-null}" '{
+      type: "user", timestamp: "2026-08-12T06:00:01.000Z",
+      uuid: ("res-" + $src), sessionId: "sess-fixture", isSidechain: false,
+      sourceToolAssistantUUID: $src, toolUseResult: $res,
+      message: { role: "user", content: [ { type: "tool_result", is_error: $err } ] }
+    }' >> "$1"
+}
+
+tool_use() {  # <name> <input-json> -> one content array
+  jq -cn --arg n "$1" --argjson i "${2:-{\}}" '[ { type: "tool_use", name: $n, input: $i } ]'
+}
+
+# --- 1. requestId grouping: usage counted ONCE per model call ------------------
+
+GROUP_LOG="$TMP_ROOT/group/session.jsonl"
+# One API response written as THREE records (thinking, text, tool_use), all with
+# requestId r1 and the same usage - exactly what the real logs contain.
+claude_call "$GROUP_LOG" r1 u1 ""   10 100 1000 50 20 '[{"type":"thinking"}]'
+claude_call "$GROUP_LOG" r1 u2 u1   10 100 1000 50 20 '[{"type":"text"}]'
+claude_call "$GROUP_LOG" r1 u3 u2   10 100 1000 50 20 "$(tool_use Bash '{"command":"ls -la"}')"
+# A second, separate API response.
+claude_call "$GROUP_LOG" r2 u4 u3    5  20 1200 30 10 "$(tool_use Edit '{"file_path":"a.sh"}')"
+claude_tool_result "$GROUP_LOG" u3 '{"stdout":"ok","stderr":""}' false
+claude_tool_result "$GROUP_LOG" u4 '{"filePath":"a.sh","structuredPatch":[{"lines":["+new","-old"," ctx"]}]}' null
+
+OUT=$("$LEDGER" --session "$GROUP_LOG" --harness claude --json 2>/dev/null)
+CALLS=$(printf '%s' "$OUT" | jq 'length')
+[ "$CALLS" = 2 ] || fail "requestId grouping: want 2 model calls from 4 records, got $CALLS"
+CR=$(printf '%s' "$OUT" | jq '[.[].cached_input_tokens] | add')
+[ "$CR" = 2200 ] || fail "cached input must be counted once per requestId: want 2200, got $CR (3200 means the duplicate records were summed)"
+OUTPUT=$(printf '%s' "$OUT" | jq '[.[].output_tokens] | add')
+[ "$OUTPUT" = 80 ] || fail "output must be counted once per requestId: want 80, got $OUTPUT"
+RECS=$(printf '%s' "$OUT" | jq '.[0].log_records')
+[ "$RECS" = 3 ] || fail "the first call must record its 3 source log records, got $RECS"
+# The tool of a grouped call comes from whichever record carried it.
+T0=$(printf '%s' "$OUT" | jq -r '.[0].tool_name')
+[ "$T0" = Bash ] || fail "grouped call tool_name: want Bash, got $T0"
+DUP=$("$LEDGER" --session "$GROUP_LOG" --harness claude 2>&1 >/dev/null | grep -c 'duplicate_usage_records=2' || true)
+[ "$DUP" = 1 ] || fail "the ledger must report duplicate_usage_records=2 so the difference from a naive sum stays visible"
+pass "one model call == one requestId; duplicated usage records are never summed"
+
+# --- 2. per-runtime semantics are NOT interchangeable -------------------------
+#
+# Same underlying call expressed the two ways each runtime reports it:
+#   claude  input 100 / cache_write 200 / cache_read 800  (DISJOINT)
+#   codex   input 1100 (INCLUDES the 800 cached) / cached 800
+# A correct implementation derives the same context (1100) and the same uncached
+# input (300) from both. Applying the wrong formula does not.
+
+SEM_CLAUDE="$TMP_ROOT/sem/claude.jsonl"
+claude_call "$SEM_CLAUDE" rc1 c1 "" 100 200 800 60 0 "$(tool_use Read '{"file_path":"x"}')"
+CL=$("$LEDGER" --session "$SEM_CLAUDE" --harness claude --json 2>/dev/null | jq '.[0]')
+[ "$(printf '%s' "$CL" | jq -r .token_semantics)" = claude_disjoint_buckets ] \
+  || fail "claude records must declare claude_disjoint_buckets"
+[ "$(printf '%s' "$CL" | jq .uncached_input_tokens)" = 300 ] \
+  || fail "claude uncached must be input+cache_write=300, got $(printf '%s' "$CL" | jq .uncached_input_tokens)"
+[ "$(printf '%s' "$CL" | jq .context_size)" = 1100 ] \
+  || fail "claude context must be input+cache_write+cache_read=1100"
+# The Codex formula (input - cached) applied to Claude numbers would be -700.
+[ "$(printf '%s' "$CL" | jq .uncached_input_tokens)" != "-700" ] \
+  || fail "the codex formula must not be applied to claude buckets"
+
+SEM_CODEX="$TMP_ROOT/sem/rollout-fixture.jsonl"
+mkdir -p "$(dirname "$SEM_CODEX")"
+jq -cn '{timestamp:"2026-08-12T06:00:00.000Z", type:"event_msg",
+  payload:{type:"custom_tool_call", name:"shell", input:{command:"ls"}}}' > "$SEM_CODEX"
+jq -cn '{timestamp:"2026-08-12T06:00:01.000Z", type:"event_msg",
+  payload:{type:"token_count", info:{ model_context_window: 272000,
+    last_token_usage:{input_tokens:1100, cached_input_tokens:800,
+      cache_write_input_tokens:200, output_tokens:60, reasoning_output_tokens:0,
+      total_tokens:1160},
+    total_token_usage:{total_tokens:1160}}}}' >> "$SEM_CODEX"
+CX=$("$LEDGER" --session "$SEM_CODEX" --json 2>/dev/null | jq '.[0]')
+[ "$(printf '%s' "$CX" | jq -r .token_semantics)" = codex_input_includes_cached ] \
+  || fail "codex records must declare codex_input_includes_cached"
+[ "$(printf '%s' "$CX" | jq .uncached_input_tokens)" = 300 ] \
+  || fail "codex uncached must be input-cached=300, got $(printf '%s' "$CX" | jq .uncached_input_tokens)"
+[ "$(printf '%s' "$CX" | jq .context_size)" = 1100 ] \
+  || fail "codex context must be input_tokens=1100 (input already contains the cached read), got $(printf '%s' "$CX" | jq .context_size)"
+[ "$(printf '%s' "$CX" | jq .context_size)" != 1900 ] \
+  || fail "the claude formula must not be applied to codex buckets (1900 double-counts the cached read)"
+
+# The report's gross_tokens must follow each record semantics, so equivalent data
+# yields the same gross rather than one inflated by the cached read.
+GC=$("$REPORT" --session "$SEM_CLAUDE" --harness claude --task-label semclaude --stdout 2>/dev/null | jq '.totals.gross_tokens')
+GX=$("$REPORT" --session "$SEM_CODEX" --task-label semcodex --stdout 2>/dev/null | jq '.totals.gross_tokens')
+[ "$GC" = 1160 ] || fail "claude gross must be in+cw+cr+out=1160, got $GC"
+[ "$GX" = 1160 ] || fail "codex gross must be in+out=1160, got $GX"
+[ "$GX" != 1960 ] || fail "codex gross must not add the cached read a second time"
+pass "claude and codex token formulas are applied per runtime and are not interchangeable"
+
+# --- 3. a missing telemetry field is "unknown", never 0 -----------------------
+
+MISS="$TMP_ROOT/miss/session.jsonl"
+mkdir -p "$(dirname "$MISS")"
+# usage with NO cache_read_input_tokens and NO thinking_tokens at all.
+jq -cn '{type:"assistant", timestamp:"2026-08-12T06:00:00.000Z", uuid:"m1",
+  parentUuid:null, requestId:"rm1", sessionId:"sess-miss", isSidechain:false,
+  message:{model:"claude-opus-5", content:[{type:"text"}],
+    usage:{input_tokens:10, cache_creation_input_tokens:20, output_tokens:5,
+           iterations:[{type:"message"}]}}}' > "$MISS"
+MJ=$("$LEDGER" --session "$MISS" --harness claude --json 2>/dev/null | jq '.[0]')
+[ "$(printf '%s' "$MJ" | jq -r .cached_input_tokens)" = unknown ] \
+  || fail "an absent cache_read_input_tokens must be \"unknown\", got $(printf '%s' "$MJ" | jq -r .cached_input_tokens)"
+[ "$(printf '%s' "$MJ" | jq -r .reasoning_tokens)" = unknown ] \
+  || fail "absent thinking_tokens must be \"unknown\", not 0"
+[ "$(printf '%s' "$MJ" | jq -r .context_size)" = unknown ] \
+  || fail "context derived from an absent bucket must be \"unknown\", not a partial sum"
+[ "$(printf '%s' "$MJ" | jq -r .duration_ms)" = unknown ] \
+  || fail "no runtime here logs a per-call duration; duration_ms must be \"unknown\""
+MR=$("$REPORT" --session "$MISS" --harness claude --task-label miss --stdout 2>/dev/null)
+[ "$(printf '%s' "$MR" | jq -r .totals.cached_input_tokens)" = unknown ] \
+  || fail "a total containing an unknown must be \"unknown\", not a partial sum presented as complete"
+pass "absent telemetry surfaces as \"unknown\" rather than 0 or an estimate"
+
+# --- 4. context anatomy: exact identity, and a real unattributed bucket -------
+
+ANAT="$TMP_ROOT/anat/session.jsonl"
+claude_call "$ANAT" a1 v1 ""   0 100 900  10 0 "$(tool_use Read '{"file_path":"a"}')"
+claude_call "$ANAT" a2 v2 v1   0 100 1400 10 0 "$(tool_use Bash '{"command":"grep -r x ."}')"
+claude_call "$ANAT" a3 v3 v2   0 100 1900 10 0 '[{"type":"text"}]'
+AR=$("$REPORT" --session "$ANAT" --harness claude --task-label anat --stdout 2>/dev/null)
+[ "$(printf '%s' "$AR" | jq -r .context_composition.static_floor_tokens)" = 1000 ] \
+  || fail "static floor must be call 1 context exactly (1000)"
+[ "$(printf '%s' "$AR" | jq -r .context_composition.identity_holds)" = true ] \
+  || fail "the composition identity must hold: floor+attributed+reductions+unattributed == final"
+[ "$(printf '%s' "$AR" | jq -r .context_composition.unattributed_context_tokens)" = 0 ] \
+  || fail "a fully explained session must report unattributed as a MEASURED 0"
+# The delta after call 1 is attributed to the action that preceded it (Read).
+[ "$(printf '%s' "$AR" | jq -r '.context_composition.attributed[] | select(.bucket=="tool:Read") | .tokens')" = 500 ] \
+  || fail "the 500-token delta must be attributed to the preceding Read"
+
+# Now a session where one delta genuinely cannot be computed: a middle call whose
+# usage is missing a bucket. That delta must go to unattributed, and the identity
+# must be reported as NOT holding rather than silently patched.
+ANAT2="$TMP_ROOT/anat2/session.jsonl"
+claude_call "$ANAT2" b1 w1 "" 0 100 900 10 0 "$(tool_use Read '{"file_path":"a"}')"
+mkdir -p "$(dirname "$ANAT2")"
+jq -cn '{type:"assistant", timestamp:"2026-08-12T06:00:02.000Z", uuid:"w2",
+  parentUuid:"w1", requestId:"b2", sessionId:"sess-fixture", isSidechain:false,
+  message:{model:"claude-opus-5", content:[{type:"text"}],
+    usage:{input_tokens:0, cache_creation_input_tokens:100, output_tokens:10,
+           iterations:[{type:"message"}]}}}' >> "$ANAT2"
+claude_call "$ANAT2" b3 w3 w2 0 100 1900 10 0 '[{"type":"text"}]'
+AR2=$("$REPORT" --session "$ANAT2" --harness claude --task-label anat2 --stdout 2>/dev/null)
+[ "$(printf '%s' "$AR2" | jq -r .context_composition.unattributed_context_tokens)" = unknown ] \
+  || fail "an uncomputable delta must make the unattributed total \"unknown\", never redistributed"
+[ "$(printf '%s' "$AR2" | jq -r .context_composition.identity_holds)" = false ] \
+  || fail "the identity must be reported as not holding when a step is unattributable"
+[ "$(printf '%s' "$AR2" | jq -r .context_composition.unattributed_steps)" -ge 1 ] \
+  || fail "unattributed_steps must count the steps that could not be attributed"
+pass "context anatomy: exact floor, delta attribution to the preceding action, honest unattributed bucket"
+
+# --- 5. phase classification and the REWORK precondition ---------------------
+
+PH="$TMP_ROOT/phase/session.jsonl"
+claude_call "$PH" p1 x1 ""  0 10 100 5 0 "$(tool_use Read '{"file_path":"a"}')"
+claude_call "$PH" p2 x2 x1  0 10 200 5 0 "$(tool_use Edit '{"file_path":"a"}')"
+claude_call "$PH" p3 x3 x2  0 10 300 5 0 "$(tool_use Bash '{"command":"bash tests/fm-lint.test.sh"}')"
+claude_call "$PH" p4 x4 x3  0 10 400 5 0 "$(tool_use Bash '{"command":"bin/fm-spawn.sh fm-x"}')"
+claude_call "$PH" p5 x5 x4  0 10 500 5 0 '[{"type":"text"}]'
+claude_call "$PH" p6 x6 x5  0 10 600 5 0 "$(tool_use Bash '{"command":"frobnicate --wibble"}')"
+PJ=$("$LEDGER" --session "$PH" --harness claude --json 2>/dev/null)
+phase_of() { printf '%s' "$PJ" | jq -r ".[$1].phase"; }
+conf_of() { printf '%s' "$PJ" | jq -r ".[$1].phase_confidence"; }
+[ "$(phase_of 0)" = DISCOVERY ] && [ "$(conf_of 0)" = high ] \
+  || fail "Read must be DISCOVERY with high confidence, got $(phase_of 0)/$(conf_of 0)"
+[ "$(phase_of 1)" = IMPLEMENTATION ] && [ "$(conf_of 1)" = high ] \
+  || fail "Edit must be IMPLEMENTATION with high confidence, got $(phase_of 1)/$(conf_of 1)"
+[ "$(phase_of 2)" = VALIDATION ] && [ "$(conf_of 2)" = medium ] \
+  || fail "a test command must be VALIDATION with medium confidence, got $(phase_of 2)/$(conf_of 2)"
+[ "$(phase_of 3)" = SUPERVISION ] \
+  || fail "a fleet-operation command must be SUPERVISION, got $(phase_of 3)"
+[ "$(phase_of 4)" = UNKNOWN ] && [ "$(conf_of 4)" = low ] \
+  || fail "a call requesting no tool must be UNKNOWN/low, not forced into a phase"
+[ "$(phase_of 5)" = UNKNOWN ] && [ "$(conf_of 5)" = low ] \
+  || fail "an unrecognised command must be UNKNOWN/low rather than guessed"
+
+# REWORK requires an ESTABLISHED failure: without an error flag an edit after a
+# validation stays IMPLEMENTATION.
+NOREW="$TMP_ROOT/norework/session.jsonl"
+claude_call "$NOREW" n1 y1 "" 0 10 100 5 0 "$(tool_use Bash '{"command":"bash tests/x.test.sh"}')"
+claude_call "$NOREW" n2 y2 y1 0 10 200 5 0 "$(tool_use Edit '{"file_path":"a"}')"
+claude_tool_result "$NOREW" y1 '{"stdout":"not ok - something failed","stderr":""}' null
+NJ=$("$LEDGER" --session "$NOREW" --harness claude --json 2>/dev/null)
+[ "$(printf '%s' "$NJ" | jq -r '.[1].phase')" = IMPLEMENTATION ] \
+  || fail "without an exact error flag REWORK must not be claimed from result text alone"
+
+# With the harness error flag set, the following edit IS rework.
+REW="$TMP_ROOT/rework/session.jsonl"
+claude_call "$REW" q1 z1 "" 0 10 100 5 0 "$(tool_use Bash '{"command":"bash tests/x.test.sh"}')"
+claude_call "$REW" q2 z2 z1 0 10 200 5 0 "$(tool_use Edit '{"file_path":"a"}')"
+claude_tool_result "$REW" z1 '{"stdout":"","stderr":"boom"}' true
+RJ=$("$LEDGER" --session "$REW" --harness claude --json 2>/dev/null)
+[ "$(printf '%s' "$RJ" | jq -r '.[0].error_result')" = true ] \
+  || fail "an is_error tool result must set error_result true"
+[ "$(printf '%s' "$RJ" | jq -r '.[1].phase')" = REWORK ] \
+  || fail "an edit after an established failure must be REWORK, got $(printf '%s' "$RJ" | jq -r '.[1].phase')"
+pass "phase rules classify by tool and command, and REWORK needs an established failure"
+
+# --- 6. compaction: parsed exactly, and zero events is a measured fact --------
+
+COMP="$TMP_ROOT/comp/session.jsonl"
+claude_call "$COMP" k1 g1 "" 0 100 900 10 0 '[{"type":"text"}]'
+mkdir -p "$(dirname "$COMP")"
+jq -cn '{type:"system", subtype:"compact_boundary", uuid:"cb1",
+  timestamp:"2026-08-12T06:00:05.000Z", sessionId:"sess-fixture",
+  compactMetadata:{trigger:"manual", preTokens:756294, postTokens:18163,
+    cumulativeDroppedTokens:738131, durationMs:178644}}' >> "$COMP"
+claude_call "$COMP" k2 g2 g1 0 100 100 10 0 '[{"type":"text"}]'
+CJ=$("$REPORT" --session "$COMP" --harness claude --task-label comp --stdout 2>/dev/null)
+[ "$(printf '%s' "$CJ" | jq '.compaction_events_measured')" = 1 ] \
+  || fail "the compact_boundary record must be measured as one compaction event"
+[ "$(printf '%s' "$CJ" | jq -r '.compaction_events[0].trigger')" = manual ] \
+  || fail "compaction trigger must be read from the record"
+[ "$(printf '%s' "$CJ" | jq '.compaction_events[0].dropped_tokens')" = 738131 ] \
+  || fail "compaction dropped tokens must be the exact logged value"
+[ "$(printf '%s' "$CJ" | jq '.compaction_events[0].call_index')" = 2 ] \
+  || fail "a compaction must attach to the first call after the boundary"
+# The post-compaction context drop is a reduction, not an unexplained reset.
+[ "$(printf '%s' "$CJ" | jq '.context_reset_events | length')" = 0 ] \
+  || fail "a drop explained by a compaction boundary must not be reported as an unexplained reset"
+# And a session with no compaction reports 0 rather than omitting the field.
+NC=$("$REPORT" --session "$GROUP_LOG" --harness claude --task-label nocomp --stdout 2>/dev/null)
+[ "$(printf '%s' "$NC" | jq '.compaction_events_measured')" = 0 ] \
+  || fail "zero compaction events must be present as a measured 0, not an absent field"
+pass "compaction boundaries parse exactly; zero events is reported as measured"
+
+# --- 7. grok turn granularity: totals exact, per-call values unknown ---------
+
+GROK="$TMP_ROOT/grok/sess/updates.jsonl"
+mkdir -p "$(dirname "$GROK")"
+jq -cn '{timestamp:"2026-08-12T06:00:00.000Z", method:"session/update",
+  params:{sessionId:"grok-sess", update:{sessionUpdate:"usage", prompt_id:"p1",
+    usage:{inputTokens:205962, outputTokens:5196, totalTokens:211158,
+      cachedReadTokens:174848, reasoningTokens:2203, modelCalls:6,
+      apiDurationMs:46898, costUsdTicks:1234,
+      modelUsage:{"grok-4.5":{inputTokens:205962, modelCalls:6}}}}}}' > "$GROK"
+GJ=$("$LEDGER" --session "$GROK" --json 2>/dev/null | jq '.[0]')
+[ "$(printf '%s' "$GJ" | jq -r .granularity)" = turn ] \
+  || fail "grok records must declare turn granularity"
+[ "$(printf '%s' "$GJ" | jq .model_calls)" = 6 ] \
+  || fail "grok model_calls must be the exact logged count"
+[ "$(printf '%s' "$GJ" | jq -r .context_size)" = unknown ] \
+  || fail "a per-turn total is not a context size; context_size must be \"unknown\", never divided by model_calls"
+[ "$(printf '%s' "$GJ" | jq -r .cache_write_tokens)" = unknown ] \
+  || fail "grok has no cache-write bucket; it must be \"unknown\""
+[ "$(printf '%s' "$GJ" | jq .uncached_input_tokens)" = 31114 ] \
+  || fail "grok uncached must be inputTokens-cachedReadTokens=31114"
+[ "$(printf '%s' "$GJ" | jq .duration_ms)" = 46898 ] \
+  || fail "grok supplies apiDurationMs per turn; it must be reported"
+GR=$("$REPORT" --session "$GROK" --task-label grok --stdout 2>/dev/null)
+[ "$(printf '%s' "$GR" | jq '.totals.calls')" = 6 ] \
+  || fail "report calls must sum model_calls (6), not count ledger records (1)"
+[ "$(printf '%s' "$GR" | jq -r '.totals.cache_write_tokens')" = unknown ] \
+  || fail "a total over an unsupplied bucket must be \"unknown\""
+pass "grok turn granularity: exact totals, per-call fields honestly unknown"
+
+# --- 8. the report lands in the PRIVATE location with a capability declaration -
+
+HOME_FIX="$TMP_ROOT/home"
+mkdir -p "$HOME_FIX/state" "$HOME_FIX/data"
+OUT_PATH=$(FM_HOME="$HOME_FIX" FM_STATE_OVERRIDE="$HOME_FIX/state" \
+  FM_DATA_OVERRIDE="$HOME_FIX/data" \
+  "$REPORT" --session "$GROUP_LOG" --harness claude --task-label demo-task 2>/dev/null)
+[ "$OUT_PATH" = "$HOME_FIX/data/token-reports/demo-task.json" ] \
+  || fail "the report must default to data/token-reports/<id>.json under the home, got $OUT_PATH"
+assert_present "$OUT_PATH" "report file written"
+CAPJ=$(jq '.capability_declaration' "$OUT_PATH")
+for rt in claude pi codex grok agy; do
+  [ "$(printf '%s' "$CAPJ" | jq --arg r "$rt" '.all_runtimes | has($r)')" = true ] \
+    || fail "the capability declaration must cover $rt"
+done
+[ "$(printf '%s' "$CAPJ" | jq -r '.all_runtimes.agy.blind_spot')" = true ] \
+  || fail "agy must be declared a blind spot"
+[ "$(printf '%s' "$CAPJ" | jq -r '.all_runtimes.grok.granularity')" = turn ] \
+  || fail "grok must be declared as turn granularity"
+[ "$(printf '%s' "$CAPJ" | jq -r '.all_runtimes.claude.cannot.duration_ms')" != null ] \
+  || fail "the declaration must say WHY claude cannot supply duration_ms"
+[ "$(jq -r '.diff_lines_added' "$OUT_PATH")" = unknown ] \
+  || fail "with no worktree the delivered diff must be \"unknown\", not 0"
+[ "$(jq -r '.edit_lines_added' "$OUT_PATH")" = 1 ] \
+  || fail "edit churn from the structured patch must be counted (1 added line)"
+[ "$(jq -r '.supervision_boundary' "$OUT_PATH")" != null ] \
+  || fail "the report must state the supervision measurement boundary"
+pass "report is written privately under data/token-reports with a full capability declaration"
+
+# --- 9. the four charts render from reports only ------------------------------
+
+CH="$TMP_ROOT/charts.html"
+"$CHARTS" --out "$CH" "$OUT_PATH" >/dev/null 2>&1 || fail "chart rendering failed"
+assert_present "$CH" "charts page written"
+HTML=$(cat "$CH")
+for heading in "context size vs call index" "cumulative token burn by bucket" \
+  "calls and tokens by phase" "context composition"; do
+  assert_contains "$HTML" "$heading" "the charts page must include the '$heading' visualisation"
+done
+assert_contains "$HTML" "unattributed" "the composition chart must always show the unattributed slice"
+assert_not_contains "$HTML" "http://" "charts must be self-contained with no network references"
+assert_not_contains "$HTML" "<script" "charts must render without scripts"
+pass "all four visualisations render from the JSON report alone"
+
+# --- 10. cross-check against the real reference sessions (optional) -----------
+#
+# These are the captain's own logs; the check is read-only and self-skips when
+# they are absent, so CI without them still passes. It pins BOTH numbers: the
+# naive per-log-record sum (which reproduces the pre-dedup figures, proving the
+# parser reads the same fields) and the deduplicated true totals.
+REF1="$HOME/.claude/projects/-Volumes-Work-AI--treehouse-mexcbot-b1b499-1-mexcbot/c0ac9bd6-e550-47a5-b90b-cae35cec1f78.jsonl"
+REF2="$HOME/.claude/projects/-Volumes-Work-AI--treehouse-firstmate-47172b-3-firstmate/ada84f96-4e49-4cc7-81e2-a0ca545f7dbc.jsonl"
+
+check_ref() {  # <log> <label> <calls> <records> <cache_read> <cache_write> <input> <output> <thinking> <ctx_first> <ctx_peak>
+  local log=$1 label=$2 j
+  j=$("$LEDGER" --session "$log" --harness claude --json 2>/dev/null) || fail "$label: ledger failed"
+  local got
+  got=$(printf '%s' "$j" | jq '{calls: length, records: ([.[].log_records]|add),
+    cr: ([.[].cached_input_tokens]|add), cw: ([.[].cache_write_tokens]|add),
+    in: ([.[].input_tokens]|add), out: ([.[].output_tokens]|add),
+    th: ([.[].reasoning_tokens]|add), first: .[0].context_size,
+    peak: ([.[].context_size]|max)}')
+  local want
+  want=$(jq -cn --argjson c "$3" --argjson r "$4" --argjson cr "$5" --argjson cw "$6" \
+    --argjson i "$7" --argjson o "$8" --argjson t "$9" --argjson f "${10}" --argjson p "${11}" \
+    '{calls:$c, records:$r, cr:$cr, cw:$cw, in:$i, out:$o, th:$t, first:$f, peak:$p}')
+  [ "$(printf '%s' "$got" | jq -S .)" = "$(printf '%s' "$want" | jq -S .)" ] \
+    || fail "$label reference mismatch:"$'\n'"got:  $got"$'\n'"want: $want"
+}
+
+if [ -f "$REF1" ] && [ -f "$REF2" ]; then
+  check_ref "$REF1" dockerize-app-stack 182 373 34124144 273290 2188 137880 50304 42182 295755
+  check_ref "$REF2" fm-treehouse-path-identity 185 279 38247886 287107 349 106901 40838 64545 309572
+  # The naive per-log-record sums the earlier survey produced, reproduced here so
+  # the double-count is provable rather than asserted: same fields, wrong unit.
+  N1=$(jq -s '[.[]|select(.type=="assistant")|.message.usage.cache_read_input_tokens//0]|add' "$REF1")
+  [ "$N1" = 66495016 ] || fail "naive per-record cache-read sum for dockerize: want 66495016, got $N1"
+  [ "$N1" != 34124144 ] || fail "the naive and deduplicated sums must differ"
+  pass "both reference sessions match the deduplicated true totals, and the naive sum is shown to differ"
+else
+  echo "skip: reference session logs not present on this host"
+fi
+
+printf 'ok - all fm-token-baseline behavior tests passed\n'

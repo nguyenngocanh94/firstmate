@@ -684,6 +684,51 @@ validate_pr_poll_cleanup() {
   done
 }
 
+# write_token_baseline_report <state-dir> <id>: generate this task's token
+# baseline report while its metadata still exists.
+#
+# STRICTLY FAIL-OPEN, and deliberately so: measurement is never allowed to
+# influence cleanup. Every path here returns 0. A missing reporter, a reporter
+# that exits non-zero, a reporter that writes nothing, and a reporter that hangs
+# are all the same outcome - one line on stderr, cleanup continues. The timeout
+# is what makes "delayed" impossible as well as "blocked"; without it a wedged
+# reporter would hold a task's cleanup open indefinitely.
+#
+# FM_TOKEN_REPORT_ON_TEARDOWN=0 disables it entirely.
+# FM_TOKEN_REPORT_TIMEOUT overrides the timeout in seconds (default 20).
+write_token_baseline_report() {
+  local state_dir=$1 id=$2 reporter timeout_s out
+  [ "${FM_TOKEN_REPORT_ON_TEARDOWN:-1}" = 0 ] && return 0
+  reporter="$SCRIPT_DIR/fm-token-report.sh"
+  [ -x "$reporter" ] || return 0
+  [ -f "$state_dir/$id.meta" ] || return 0
+  timeout_s=${FM_TOKEN_REPORT_TIMEOUT:-20}
+  case "$timeout_s" in ''|*[!0-9]*) timeout_s=20 ;; esac
+  # timeout -> gtimeout -> perl alarm, the same ladder bin/fm-fleet-snapshot.sh
+  # uses. macOS ships none of the coreutils timeouts but does ship perl, so
+  # without the perl rung the bound would silently vanish on the platform this
+  # fleet actually runs on. With no rung at all the report is SKIPPED rather than
+  # run unbounded: losing a measurement is always preferable to delaying cleanup.
+  if command -v timeout >/dev/null 2>&1; then
+    out=$(timeout "$timeout_s" "$reporter" --task "$id" 2>&1)
+  elif command -v gtimeout >/dev/null 2>&1; then
+    out=$(gtimeout "$timeout_s" "$reporter" --task "$id" 2>&1)
+  elif command -v perl >/dev/null 2>&1; then
+    out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
+      "$timeout_s" "$reporter" --task "$id" 2>&1)
+  else
+    echo "note: token baseline report skipped for $id (no timeout mechanism available)" >&2
+    return 0
+  fi
+  if [ -n "$out" ]; then
+    case "$out" in
+      /*) : ;;  # the written report path, the success case
+      *) echo "note: token baseline report skipped for $id ($out)" >&2 ;;
+    esac
+  fi
+  return 0
+}
+
 remove_pr_poll_artifacts() {
   local state_dir=$1 id=$2 quarantine artifact
   validate_pr_poll_cleanup "$state_dir" "$id" || return 1
@@ -2357,6 +2402,17 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
 remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
+# Token baseline report, written HERE and nowhere later: the session log outlives
+# teardown but this task's metadata does not, and the report needs the metadata
+# (harness, model, worktree, PR, delivery mode) for its identity. So it is
+# generated on the last line where that metadata still exists.
+#
+# STRICTLY FAIL-OPEN. Cleanup must never be blocked, delayed, or altered by
+# measurement: the reporter runs under a hard timeout, every failure mode is
+# discarded, and control always reaches the removal below.
+# tests/fm-token-baseline.test.sh proves cleanup completes with a reporter that
+# fails, and with one that hangs past the timeout.
+write_token_baseline_report "$STATE" "$ID"
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token"
