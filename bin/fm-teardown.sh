@@ -709,13 +709,17 @@ write_token_baseline_report() {
   # without the perl rung the bound would silently vanish on the platform this
   # fleet actually runs on. With no rung at all the report is SKIPPED rather than
   # run unbounded: losing a measurement is always preferable to delaying cleanup.
+  # Every capture below MUST carry `|| true`. This script runs under `set -e`,
+  # so a bare `out=$(failing-reporter)` aborts teardown at that line - which is
+  # precisely the coupling this hook exists to avoid, and which the fail-open
+  # cases in tests/fm-teardown.test.sh caught.
   if command -v timeout >/dev/null 2>&1; then
-    out=$(timeout "$timeout_s" "$reporter" --task "$id" 2>&1)
+    out=$(timeout "$timeout_s" "$reporter" --task "$id" 2>&1) || true
   elif command -v gtimeout >/dev/null 2>&1; then
-    out=$(gtimeout "$timeout_s" "$reporter" --task "$id" 2>&1)
+    out=$(gtimeout "$timeout_s" "$reporter" --task "$id" 2>&1) || true
   elif command -v perl >/dev/null 2>&1; then
     out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
-      "$timeout_s" "$reporter" --task "$id" 2>&1)
+      "$timeout_s" "$reporter" --task "$id" 2>&1) || true
   else
     echo "note: token baseline report skipped for $id (no timeout mechanism available)" >&2
     return 0
