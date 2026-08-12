@@ -157,6 +157,10 @@ It owns `config/token-budget` and API-equivalent pricing.
 
 Both tools share one attribution mapping, [`bin/fm-token-attrib-lib.sh`](../bin/fm-token-attrib-lib.sh), so a session is attributed to the same fleet source either way.
 
+That shared mapping registers every attribution root under **each name of its location**, via [`bin/fm-path-identity-lib.sh`](../bin/fm-path-identity-lib.sh).
+This is load-bearing rather than defensive: a symlinked pool root gives one directory two absolute names, and a Claude session directory is encoded from whichever name that session's working directory carried.
+Registering one name only would drop a whole secondmate home or task worktree into `other:<encoded-dir>`.
+
 The two do **not** currently agree on totals.
 `fm-token-usage.sh` sums usage per log record, which the requestId finding above shows double-counts Claude tokens; the ledger counts one usage per model call.
 That difference is known and deliberate to leave in place here, because correcting the fleet reader changes the captain's live budget-alarm thresholds and belongs in its own change rather than inside a measurement baseline.

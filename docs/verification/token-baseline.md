@@ -6,7 +6,7 @@ This page records evidence only.
 
 Date: 2026-08-12.
 Host: Darwin 25.5.0 (arm64), GNU bash 5.3.15, jq 1.7.1-apple, ShellCheck 0.11.0.
-Comparison base: `main` at `735f8b9`.
+Comparison base: `main` at `83f7549` (rebased onto it after PR 3 landed; originally measured against `735f8b9`, whose token figures below are unaffected because PR 3 changed attribution, not usage arithmetic).
 
 Neither `timeout` nor `gtimeout` is installed on this host, so the teardown hook's bound comes from its `perl` rung.
 That rung is the reason the ladder exists: without it the timeout would silently vanish on the platform this fleet runs on.
@@ -58,14 +58,14 @@ Corrected totals against the per-record totals:
 Context first and peak are identical under both methods (42,182 / 295,755 and 64,545 / 309,572), because the first record and the maximum are unaffected by duplicate records.
 
 Every total above is anchored to a specific log state: 373 assistant records for `dockerize-app-stack` and 279 for `fm-treehouse-path-identity`.
-The dockerize session was still live and grew to 446 assistant records during review, which is why the suite gates its exact pins on the assistant-record count rather than asserting them unconditionally.
+The dockerize session was still live and kept growing during review - 446 assistant records at one observation, 482 at a later one - which is why the suite gates its exact pins on the assistant-record count rather than asserting them unconditionally.
 When a log has grown past its pinned state the suite prints an explicit skip naming the drift and still runs the length-independent grouping invariants, so a grown log can never be mistaken for a silent pass.
 
 An independent cross-check confirms the grouping rather than merely restating it: per-tool counts are carried on `tool_use` blocks, which are unique per call and so are untouched by the usage duplication.
 The ledger's per-tool counts for `fm-treehouse-path-identity` are Bash 133, Edit 37, Read 8, Write 3, Skill 1, Monitor 1, ToolSearch 1 - identical to a direct count of `tool_use` blocks in the log, while the duplicated usage is removed.
 Its 26 `multiple` and 6 `none` tool buckets for `dockerize-app-stack` likewise match the 26 two-tool and 6 zero-tool groups counted directly.
 
-`tests/fm-token-baseline.test.sh` pins both numbers for both sessions, and pins the naive per-record cache-read sum alongside, so the double-count stays provable.
+`tests/fm-token-baseline.test.sh` asserts both numbers and asserts that they differ, so the double-count stays provable: the per-call totals through the ledger, and the naive per-record cache-read sum read straight from the log.
 
 ## Per-runtime telemetry probes
 
@@ -124,6 +124,52 @@ Compaction detection is therefore exact rather than threshold-based.
 A `user` record with `isCompactSummary: true` marks the injected summary.
 Context was monotonically non-decreasing across both reference sessions (0 decreases in 372 and 278 deltas), so an unexplained decrease needs no magnitude threshold to be meaningful.
 
+## Dual-name attribution survives the extraction
+
+`bin/fm-token-attrib-lib.sh` extracts the attribution mapping out of `bin/fm-token-usage.sh`, so it must carry PR 3's registration of every root under each name of its location - the logical name that walks a symlinked ancestor and the physically resolved one.
+It does so through `bin/fm-path-identity-lib.sh` rather than a second private copy of the idea, and sources that library itself so the dependency has one owner.
+
+Sourcing the extracted library alone and building its roots against the live primary home shows both names registered for every root that has two:
+
+```console
+$ ls -ld ~/.treehouse
+lrwxr-xr-x  1 erics  staff  27 Aug 11 12:22 /Users/erics/.treehouse -> /Volumes/Work/AI/.treehouse
+$ FM_HOME=/Volumes/Work/AI/firstmate FM_STATE=$FM_HOME/state FM_DATA=$FM_HOME/data \
+  CLAUDE_PROJECTS=$HOME/.claude/projects \
+  bash -c '. bin/fm-token-attrib-lib.sh; fm_token_build_roots
+           printf "%s\n" "$FM_TOKEN_ROOTS" | grep -i treehouse | sort -u'
+-Users-erics--treehouse                                 crew:unattributed
+-Users-erics--treehouse-firstmate-47172b-1-firstmate     mate:vaultmate
+-Users-erics--treehouse-firstmate-47172b-2-firstmate     mate:mexcmate
+-Volumes-Work-AI--treehouse                             crew:unattributed
+-Volumes-Work-AI--treehouse-firstmate-47172b-1-firstmate mate:vaultmate
+-Volumes-Work-AI--treehouse-firstmate-47172b-2-firstmate mate:mexcmate
+-Volumes-Work-AI--treehouse-firstmate-47172b-4-firstmate task:fm-token-baseline-measure
+```
+
+A root recorded only under its physical name yields one encoding, which is why `task:fm-token-baseline-measure` appears once: its `worktree=` was recorded physically, so the location has no second name to register.
+
+End to end, the rebased reader attributes the live fleet identically to `main`:
+
+```console
+$ FM_HOME=/Volumes/Work/AI/firstmate FM_ROOT_OVERRIDE=$PWD \
+  bin/fm-token-usage.sh --json --window 720 | jq -r '.source_totals[] | "\(.source)\t\(.tokens)"'
+crew:unattributed                 2514139597
+primary                           2027558985
+mate:vaultmate                     822989738
+pipeline                           669244552
+mate:mexcmate                      154144277
+task:fm-token-baseline-measure     120915607
+other:...
+```
+
+Running `main`'s own reader against the same home produced a byte-identical source list, differing only in `task:fm-token-baseline-measure` (122215321), which is the still-running session of this task burning tokens between the two invocations.
+
+`task:dockerize-app-stack` no longer appears under either reader: `state/dockerize-app-stack.meta` has since been removed by that task's cleanup, so its worktree maps to no task and its sessions fall correctly into `crew:unattributed`.
+That is a teardown since the earlier check, not an attribution regression - `main` alone behaves the same way.
+
+PR 3's own regression case, `a root recorded under either name attributes its sessions instead of falling into other:` in `tests/fm-token-usage.test.sh`, passes against the extracted library unchanged.
+
 ## Suites
 
 ```console
@@ -131,6 +177,8 @@ $ bash tests/fm-token-baseline.test.sh | tail -1
 ok - all fm-token-baseline behavior tests passed
 $ bash tests/fm-token-usage.test.sh | tail -1
 ok - all fm-token-usage behavior tests passed
+$ bash tests/fm-path-identity.test.sh | tail -1
+ok - fm_path_treehouse_return tries every name when no failure class is claimed
 $ bin/fm-lint.sh | tail -1
 fm-lint.sh: ShellCheck 0.11.0 (pinned 0.11.0)
 ```
@@ -145,7 +193,8 @@ Its reference cross-check self-skips when the captain's logs are absent, so the 
 `tests/fm-teardown.test.sh` gains two fail-open cases: a reporter that genuinely fails (an empty session-log root, so the ledger cannot resolve a log) and one that genuinely hangs (a FIFO in place of the session log, which nothing ever writes to).
 Both assert cleanup still exits 0, still removes every durable task record, and in the hang case completes within a bound.
 
-`tests/fm-token-usage.test.sh` passes unchanged after the attribution mapping moved into `bin/fm-token-attrib-lib.sh`, which is what establishes that extraction as behavior-preserving.
+`tests/fm-token-usage.test.sh` passes unchanged after the attribution mapping moved into `bin/fm-token-attrib-lib.sh`, which is what establishes that extraction as behavior-preserving - including the two symlink-attribution cases PR 3 added to it.
+`tests/fm-path-identity.test.sh` passes unchanged, so the library the extraction now depends on is intact.
 
 ## Known limitation of this evidence
 
