@@ -82,6 +82,9 @@ Tool results are `role: "toolResult"` records carrying `toolCallId`, `toolName` 
 Granularity is per model call, not per turn: one 908-line rollout carried 161 `token_count` records against 10 `user_message` records, and its running `total_token_usage.total_tokens` advanced by exactly `last_token_usage.total_tokens` on every record except 2 non-advancing re-emissions.
 The parser drops those 2 as duplicates rather than adding them, and counts them in `codex_duplicate_token_counts`.
 A `context_compacted` payload exists but carries no fields beyond its type, so its magnitude is `unknown`.
+Codex names its shell tool `exec` and passes its `payload.input` as a **string** - a JS snippet of the form `const r = await tools.exec_command({cmd:"..."})` - rather than an object with a command field.
+The phase classifier therefore type-guards tool input before any field access, and reads the command text out of that string; without the guard, indexing a string would raise a jq error rather than fall through to `UNKNOWN`.
+Running the ledger over the 908-line rollout confirms the end-to-end result: 159 calls, 1 compaction event, and phases 38 `VALIDATION` / 32 `IMPLEMENTATION` / 25 `DISCOVERY` / 64 `UNKNOWN`, against 159 `UNKNOWN` before the guard.
 
 **grok** - `prompt_history.jsonl` carries only `timestamp`, `session_id`, `prompt`, `is_bash`, and `session_search.sqlite` is an FTS5 index over transcripts (`meta`, `session_docs`, `session_docs_fts*`) with no usage column.
 Real usage lives in each session's `updates.jsonl` at `params.update.usage`:
