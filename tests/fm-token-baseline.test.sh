@@ -364,39 +364,93 @@ pass "all four visualisations render from the JSON report alone"
 
 # --- 10. cross-check against the real reference sessions (optional) -----------
 #
-# These are the captain's own logs; the check is read-only and self-skips when
-# they are absent, so CI without them still passes. It pins BOTH numbers: the
-# naive per-log-record sum (which reproduces the pre-dedup figures, proving the
-# parser reads the same fields) and the deduplicated true totals.
+# These are the captain's own logs, read read-only; the check self-skips when they
+# are absent, so CI without them still passes.
+#
+# A session log GROWS while its session is alive, so exact totals are only valid
+# for the log state they were measured at. Pinning them unconditionally would
+# rot - and did: the dockerize log went from 855 to 1024 lines mid-review.
+#
+# The pins are therefore gated on the number of ASSISTANT records, not on total
+# lines: the totals depend on exactly those records, so appending a pr-link or
+# ai-title record must not disarm a still-valid pin, while a new model call must.
+# A drifted log is reported as an explicit skip, never a silent pass.
+# The length-INDEPENDENT invariants below always run, because they hold for any
+# state of the log and are what actually encode the grouping contract.
 REF1="$HOME/.claude/projects/-Volumes-Work-AI--treehouse-mexcbot-b1b499-1-mexcbot/c0ac9bd6-e550-47a5-b90b-cae35cec1f78.jsonl"
 REF2="$HOME/.claude/projects/-Volumes-Work-AI--treehouse-firstmate-47172b-3-firstmate/ada84f96-4e49-4cc7-81e2-a0ca545f7dbc.jsonl"
+# Assistant-record count each pinned expectation below was measured at, on 2026-08-12.
+REF1_ASSISTANTS=373
+REF2_ASSISTANTS=279
+REF_EXACT_CHECKED=0
 
-check_ref() {  # <log> <label> <calls> <records> <cache_read> <cache_write> <input> <output> <thinking> <ctx_first> <ctx_peak>
-  local log=$1 label=$2 j
+# ref_invariants <log> <label> <ctx_first>: the checks that hold at ANY log
+# length. These are the grouping contract itself, so they are never skipped.
+ref_invariants() {
+  local log=$1 label=$2 want_first=$3 j calls records dups naive dedup first
+  j=$("$LEDGER" --session "$log" --harness claude --json 2>/dev/null) \
+    || fail "$label: ledger failed"
+  calls=$(printf '%s' "$j" | jq 'length')
+  records=$(printf '%s' "$j" | jq '[.[].log_records] | add')
+  dups=$("$LEDGER" --session "$log" --harness claude 2>&1 >/dev/null \
+    | sed -n 's/.*duplicate_usage_records=\([0-9]*\).*/\1/p' | head -1)
+  [ -n "$dups" ] || dups=0
+  [ "$records" -gt "$calls" ] \
+    || fail "$label: $records log records collapsed to $calls calls; grouping did nothing"
+  [ "$dups" = "$(( records - calls ))" ] \
+    || fail "$label: duplicate_usage_records=$dups must equal records-calls=$(( records - calls ))"
+  # The first record never changes as a session grows, so its context is a stable pin.
+  first=$(printf '%s' "$j" | jq '.[0].context_size')
+  [ "$first" = "$want_first" ] \
+    || fail "$label: first-call context: want $want_first, got $first"
+  # The double-count is real: the naive per-record sum must exceed the per-call sum.
+  naive=$(jq -s '[.[]|select(.type=="assistant")|.message.usage.cache_read_input_tokens//0]|add' "$log")
+  dedup=$(printf '%s' "$j" | jq '[.[].cached_input_tokens] | add')
+  [ "$naive" -gt "$dedup" ] \
+    || fail "$label: naive per-record cache read ($naive) must exceed the per-call sum ($dedup)"
+  [ "$(printf '%s' "$j" | jq -r '[.[].granularity] | unique | join(",")')" = call ] \
+    || fail "$label: every claude record must be call granularity"
+  [ "$(printf '%s' "$j" | jq -r '[.[].token_semantics] | unique | join(",")')" = claude_disjoint_buckets ] \
+    || fail "$label: every claude record must declare claude_disjoint_buckets"
+}
+
+# check_ref_totals <log> <label> <expected-assistant-records> <calls> <records>
+#   <cache_read> <cache_write> <input> <output> <thinking> <ctx_first> <ctx_peak>
+# Exact pins, valid only while the log still holds the measured model calls.
+check_ref_totals() {
+  local log=$1 label=$2 want_assistants=$3 assistants j got want
+  shift 3
+  assistants=$(jq -s '[.[]|select(.type=="assistant")]|length' "$log" 2>/dev/null) || assistants=
+  if [ "$assistants" != "$want_assistants" ]; then
+    echo "skip: $label exact totals - log now holds $assistants assistant records, pinned at $want_assistants (session grew); invariants still checked"
+    return 0
+  fi
+  REF_EXACT_CHECKED=$(( REF_EXACT_CHECKED + 1 ))
   j=$("$LEDGER" --session "$log" --harness claude --json 2>/dev/null) || fail "$label: ledger failed"
-  local got
   got=$(printf '%s' "$j" | jq '{calls: length, records: ([.[].log_records]|add),
     cr: ([.[].cached_input_tokens]|add), cw: ([.[].cache_write_tokens]|add),
     in: ([.[].input_tokens]|add), out: ([.[].output_tokens]|add),
     th: ([.[].reasoning_tokens]|add), first: .[0].context_size,
     peak: ([.[].context_size]|max)}')
-  local want
-  want=$(jq -cn --argjson c "$3" --argjson r "$4" --argjson cr "$5" --argjson cw "$6" \
-    --argjson i "$7" --argjson o "$8" --argjson t "$9" --argjson f "${10}" --argjson p "${11}" \
+  want=$(jq -cn --argjson c "$1" --argjson r "$2" --argjson cr "$3" --argjson cw "$4" \
+    --argjson i "$5" --argjson o "$6" --argjson t "$7" --argjson f "$8" --argjson p "$9" \
     '{calls:$c, records:$r, cr:$cr, cw:$cw, in:$i, out:$o, th:$t, first:$f, peak:$p}')
   [ "$(printf '%s' "$got" | jq -S .)" = "$(printf '%s' "$want" | jq -S .)" ] \
     || fail "$label reference mismatch:"$'\n'"got:  $got"$'\n'"want: $want"
 }
 
 if [ -f "$REF1" ] && [ -f "$REF2" ]; then
-  check_ref "$REF1" dockerize-app-stack 182 373 34124144 273290 2188 137880 50304 42182 295755
-  check_ref "$REF2" fm-treehouse-path-identity 185 279 38247886 287107 349 106901 40838 64545 309572
-  # The naive per-log-record sums the earlier survey produced, reproduced here so
-  # the double-count is provable rather than asserted: same fields, wrong unit.
-  N1=$(jq -s '[.[]|select(.type=="assistant")|.message.usage.cache_read_input_tokens//0]|add' "$REF1")
-  [ "$N1" = 66495016 ] || fail "naive per-record cache-read sum for dockerize: want 66495016, got $N1"
-  [ "$N1" != 34124144 ] || fail "the naive and deduplicated sums must differ"
-  pass "both reference sessions match the deduplicated true totals, and the naive sum is shown to differ"
+  ref_invariants "$REF1" dockerize-app-stack 42182
+  ref_invariants "$REF2" fm-treehouse-path-identity 64545
+  check_ref_totals "$REF1" dockerize-app-stack "$REF1_ASSISTANTS" \
+    182 373 34124144 273290 2188 137880 50304 42182 295755
+  check_ref_totals "$REF2" fm-treehouse-path-identity "$REF2_ASSISTANTS" \
+    185 279 38247886 287107 349 106901 40838 64545 309572
+  if [ "$REF_EXACT_CHECKED" -gt 0 ]; then
+    pass "reference sessions satisfy the grouping invariants, and $REF_EXACT_CHECKED of 2 still match their exact pinned totals"
+  else
+    pass "reference sessions satisfy the grouping invariants (both logs have grown past their pinned totals)"
+  fi
 else
   echo "skip: reference session logs not present on this host"
 fi

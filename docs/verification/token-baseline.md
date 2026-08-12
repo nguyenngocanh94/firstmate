@@ -57,6 +57,10 @@ Corrected totals against the per-record totals:
 
 Context first and peak are identical under both methods (42,182 / 295,755 and 64,545 / 309,572), because the first record and the maximum are unaffected by duplicate records.
 
+Every total above is anchored to a specific log state: 373 assistant records for `dockerize-app-stack` and 279 for `fm-treehouse-path-identity`.
+The dockerize session was still live and grew to 446 assistant records during review, which is why the suite gates its exact pins on the assistant-record count rather than asserting them unconditionally.
+When a log has grown past its pinned state the suite prints an explicit skip naming the drift and still runs the length-independent grouping invariants, so a grown log can never be mistaken for a silent pass.
+
 An independent cross-check confirms the grouping rather than merely restating it: per-tool counts are carried on `tool_use` blocks, which are unique per call and so are untouched by the usage duplication.
 The ledger's per-tool counts for `fm-treehouse-path-identity` are Bash 133, Edit 37, Read 8, Write 3, Skill 1, Monitor 1, ToolSearch 1 - identical to a direct count of `tool_use` blocks in the log, while the duplicated usage is removed.
 Its 26 `multiple` and 6 `none` tool buckets for `dockerize-app-stack` likewise match the 26 two-tool and 6 zero-tool groups counted directly.
@@ -130,6 +134,10 @@ ok - all fm-token-usage behavior tests passed
 $ bin/fm-lint.sh | tail -1
 fm-lint.sh: ShellCheck 0.11.0 (pinned 0.11.0)
 ```
+
+The reference cross-check runs two tiers.
+Length-independent invariants always run on both logs: more log records than model calls, `duplicate_usage_records` exactly equal to their difference, the first call's context (immutable as a session grows), a naive per-record cache-read sum strictly greater than the per-call sum, and every record declaring call granularity with Claude semantics.
+Exact totals are pinned only at the recorded assistant-record count.
 
 `tests/fm-token-baseline.test.sh` covers requestId grouping, the non-interchangeability of the Claude and Codex formulas in both directions, absent telemetry surfacing as `unknown` rather than 0, the context-composition identity plus a genuinely unattributable delta, the phase rules including `REWORK`'s exact-failure precondition and its refusal to fire on failure text alone, compaction parsed with exact magnitudes and zero events reported as measured, grok turn granularity, the private report location with its capability declaration, and the four chart renderings.
 Its reference cross-check self-skips when the captain's logs are absent, so the suite stays runnable on any host.
