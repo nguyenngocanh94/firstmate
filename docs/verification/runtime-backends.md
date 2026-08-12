@@ -175,6 +175,51 @@ Valid cleanup removed only the exact task-bound target and left the control wind
 The metadata-only validation covers tmux, Herdr, Zellij, Orca, and cmux before backend dispatch.
 Claude, Codex, OpenCode, Pi, pi-signed, Grok, and Kimi share that backend cleanup boundary; their harness-specific hook files and token cleanup run only after it, so no harness needs a separate endpoint parser.
 
+## treehouse worktree provider
+
+treehouse provides the task worktree for every session-provider-only backend (tmux, Herdr, Zellij, cmux), so this evidence applies to all four.
+
+### Pool registry path identity
+
+`treehouse return` matches its pool registry by literal path string, and `treehouse status` reports the name it registered.
+Verified on 2026-08-12 with treehouse v2.1.0 on macOS 26.5.2 arm64, using a pool whose configured root is reached through a symlink, so one worktree has both a logical and a physically resolved name.
+The pool prefix is elided as `$root`.
+
+```sh
+treehouse status                                    # the name treehouse registered
+treehouse return --force "$physically_resolved_name"
+```
+
+Observed output:
+
+```text
+1     leased       $root/link/.treehouse/repo-5a408d/1/repo  (held by verify)
+worktree $root/phys/.treehouse/repo-5a408d/1/repo is not managed by treehouse
+```
+
+The return exited 1 and the lease stayed held: a name that resolves to the registered worktree is still rejected when the string differs.
+This is why [`bin/fm-teardown.sh`](../../bin/fm-teardown.sh) and [`bin/fm-home-seed.sh`](../../bin/fm-home-seed.sh) return through [`bin/fm-path-identity-lib.sh`](../../bin/fm-path-identity-lib.sh) rather than passing a recorded name straight through.
+`treehouse status` is a rendered surface, so it is never the sole basis of a verdict: the library reads git's worktree list as a second independent registry and keeps a candidate only when it provably resolves to the same directory, and a location no name is accepted for still fails loudly.
+
+Recovery through that library, same run and versions:
+
+```sh
+. bin/fm-path-identity-lib.sh
+fm_path_registry_names "$physically_resolved_name" "$pool_dir"
+fm_path_treehouse_return "$pool_dir" "$physically_resolved_name"
+```
+
+Observed output:
+
+```text
+$root/phys/.treehouse/repo-5a408d/1/repo
+$root/link/.treehouse/repo-5a408d/1/repo
+🌳 Worktree returned to pool.
+```
+
+`treehouse status` then reported the slot `available`.
+[`tests/fm-path-identity.test.sh`](../../tests/fm-path-identity.test.sh) pins the same behavior portably against a stub that keys on one literal name, including the refusal direction; re-run the live commands above after a treehouse upgrade.
+
 ## Herdr
 
 The compatibility floor is protocol 14.

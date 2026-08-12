@@ -87,6 +87,15 @@
 # checks before any destructive return. Teardown output notes every wait, retry, and
 # removal so the operator can see what happened.
 #
+# Recorded-name recovery: treehouse matches its pool registry by literal path
+# string, so a worktree recorded under one name of a location and registered
+# under another - the two names a symlinked ancestor creates - is answered "not
+# managed by treehouse" and used to abort teardown with the task's state still
+# looking live. teardown_treehouse_return therefore returns through
+# bin/fm-path-identity-lib.sh, which retries every other name that provably
+# resolves to the same directory. A path no name resolves for is still an
+# abort: unrecognized stays unrecognized, and no work is discarded on the way.
+#
 # Pre-teardown cleanup sequence (runs once every landed/discard-work safety
 # refusal above has already passed, and BEFORE any worktree return, branch
 # delete, or backend kill below - a still-active run or a leaked process may
@@ -152,6 +161,8 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
+# shellcheck source=bin/fm-path-identity-lib.sh
+. "$SCRIPT_DIR/fm-path-identity-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -991,14 +1002,19 @@ cleanup_stale_lock_for_safety_check() {
 }
 
 # Return a worktree/home via `treehouse return --force`, tolerating a transient or
-# stale git index.lock left by a killed crew process. See the script header.
+# stale git index.lock left by a killed crew process, and tolerating a recorded
+# name that differs from the one treehouse registered for the same location. See
+# the script header; bin/fm-path-identity-lib.sh owns the name reconciliation and
+# is given treehouse_return_is_index_lock_error so a lock failure stays with the
+# retry path below instead of being retried under another name.
 teardown_treehouse_return() {
   local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-}
   local out lock attempt=0 max_retries lock_desc
 
   # Capture stdout+stderr so non-lock failures stay visible and lock failures can
   # be matched by signature even when the lock file is already gone mid-check.
-  if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+  if out=$(fm_path_treehouse_return "$cd_dir" "$dir" \
+             treehouse_return_is_index_lock_error 2>&1); then
     [ -n "$out" ] && printf '%s\n' "$out"
     return 0
   fi
@@ -1023,7 +1039,8 @@ teardown_treehouse_return() {
     echo "teardown: $label return failed with transient git lock ($lock_desc); waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s and retrying ($attempt/${max_retries})" >&2
     sleep "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS"
 
-    if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+    if out=$(fm_path_treehouse_return "$cd_dir" "$dir" \
+               treehouse_return_is_index_lock_error 2>&1); then
       [ -n "$out" ] && printf '%s\n' "$out"
       echo "teardown: $label return succeeded on retry; lock cleared on its own" >&2
       return 0
@@ -1050,7 +1067,8 @@ teardown_treehouse_return() {
           return 1
         fi
       fi
-      if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+      if out=$(fm_path_treehouse_return "$cd_dir" "$dir" \
+                 treehouse_return_is_index_lock_error 2>&1); then
         [ -n "$out" ] && printf '%s\n' "$out"
         echo "teardown: $label return succeeded after stale-lock cleanup" >&2
         return 0

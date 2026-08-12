@@ -49,6 +49,8 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-secondmate-charter-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-path-identity-lib.sh
+. "$SCRIPT_DIR/fm-path-identity-lib.sh"
 
 usage() {
   echo "usage: fm-home-seed.sh <id> <home|-> {<project>...|--no-projects}" >&2
@@ -582,7 +584,10 @@ seed_return_treehouse_home() {
     echo "warning: failed to return treehouse-acquired home $abs_home during seed rollback; treehouse command not found" >&2
     return 0
   fi
-  ( cd "$FM_ROOT" && treehouse return --force "$abs_home" >/dev/null ) || {
+  # The rollback target is physically resolved, which need not be the name
+  # treehouse registered for the same location; bin/fm-path-identity-lib.sh tries
+  # every name so a symlinked pool root cannot leak the lease.
+  fm_path_treehouse_return "$FM_ROOT" "$abs_home" >/dev/null || {
     echo "warning: failed to return treehouse-acquired home $abs_home during seed rollback; lease may still be held" >&2
     return 0
   }

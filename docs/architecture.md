@@ -137,6 +137,10 @@ Codex App support is recorded in `docs/codex-app-backend.md`; it is not selectab
 Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for tmux, herdr, zellij, and cmux tasks, while Orca creates its own worktrees for `backend=orca`.
 For ship and scout work, `fm-spawn.sh` refuses to launch unless the resolved task path is a real git worktree root that is distinct from the project primary checkout.
 
+One directory can have more than one absolute name when an ancestor is a symlink, and firstmate's records disagree about which one they hold: a worktree path read from a terminal's cwd is physically resolved, while treehouse's own output and registered `home:` fields are logical.
+That is invisible to anything that just cd's or `git -C`s a recorded path, and fatal only where another system matches path strings rather than inodes - treehouse's pool registry, which answers "not managed by treehouse" for a name it never recorded, and Claude Code's encoded session-log directory names.
+`bin/fm-path-identity-lib.sh` owns that reconciliation for those readers: it derives a path's physical name, recovers a logical one from git's worktree list or `treehouse status`, and keeps a candidate only when it provably resolves to the same directory, so a name nothing recognizes still fails rather than being guessed at.
+
 The firstmate repo has one extra exposure because it can dispatch crewmates to work on itself.
 Its operating checkout (`FM_ROOT`) and the disposable crewmate worktrees are all linked git worktrees of the same repository, so the valid discriminator is branch state, not whether the checkout is linked.
 The primary checkout is healthy on its default branch, and linked worktrees or secondmate homes are healthy at detached HEAD.
