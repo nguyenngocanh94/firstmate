@@ -7,7 +7,7 @@
 # and GitHub reports a PR head that contains the current local work, or its content
 # is already in the up-to-date default branch.
 #
-# Covers three fixes:
+# Covers four fixes:
 #   - local-only fork-remote: a fork IS a remote, so fork-pushed upstream-
 #     contribution PRs are teardown-eligible (the pre-fix code false-refused them).
 #   - squash-merge-then-delete-branch: the branch's own commits live nowhere on a
@@ -19,6 +19,9 @@
 #     git index.lock that blocks teardown. The return path retries on the lock
 #     error signature (even if the lock self-clears mid-check), then only removes a
 #     provably stale lock before re-running safety checks.
+#   - already-returned idempotency: a failed return is accepted only when
+#     treehouse's structured status reports the exact worktree available,
+#     unleased, and unused. Unknown, leased, and in-use worktrees still refuse.
 #
 # Matrix:
 #   (a) local-only + HEAD on a fork remote-tracking branch     -> ALLOW  (fork fix)
@@ -485,6 +488,52 @@ exit 0
 SH
   chmod +x "$case_dir/fakebin/treehouse"
   : > "$case_dir/treehouse.log"
+}
+
+# Override treehouse with a return failure plus an explicit structured registry
+# state. This models the postcondition check without touching a real pool slot.
+add_return_failure_treehouse_state() {  # <case-dir> <registered-name> <status> <lease-holder> <process-count>
+  local case_dir=$1 registered=$2 status=$3 lease_holder=$4 process_count=$5
+  jq -n \
+    --arg path "$registered" \
+    --arg status "$status" \
+    --arg lease_holder "$lease_holder" \
+    --argjson process_count "$process_count" \
+    '[{path:$path,status:$status,lease_holder:$lease_holder,
+       processes:[range(0;$process_count) | {pid:(1000 + .),name:"fixture"}]}]' \
+    > "$case_dir/treehouse-status.json"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$case_dir/treehouse.log"
+case "\${1:-}" in
+  status)
+    if [ "\${2:-}" = --json ]; then
+      cat "$case_dir/treehouse-status.json"
+    else
+      printf '1     %s    %s\n' "$status" "$registered"
+    fi
+    exit 0
+    ;;
+  return)
+    echo "worktree \${3:-\${2:-}} is not managed by treehouse" >&2
+    exit 1
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+  : > "$case_dir/treehouse.log"
+}
+
+add_token_report_probe() {  # <case-dir>
+  local case_dir=$1
+  cat > "$case_dir/fakebin/timeout" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$case_dir/token-report.log"
+exit 124
+SH
+  chmod +x "$case_dir/fakebin/timeout"
+  : > "$case_dir/token-report.log"
 }
 
 git_index_lock_path() {
@@ -2584,6 +2633,99 @@ test_unknown_worktree_still_aborts_teardown() {
   pass "a worktree treehouse manages under no name still aborts teardown with its state intact"
 }
 
+# (ac) The live incident: the return command fails because the exact worktree
+# is already available, unleased, and unused. That is the return postcondition,
+# so teardown must continue through reporting, endpoint cleanup, record cleanup,
+# clone refresh, and the backlog reminder.
+test_already_returned_worktree_completes_teardown() {
+  local case_dir gen origin_head rc artifact
+  case_dir=$(make_case already-returned)
+  write_meta "$case_dir" no-mistakes ship
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$case_dir/state" task-x1)
+  printf 'busy_gen=%s\n' "$gen" >> "$case_dir/state/task-x1.meta"
+  for artifact in status turn-ended check.sh pr-poll pr-poll-registration check-trust; do
+    : > "$case_dir/state/task-x1.$artifact"
+  done
+  land_on_origin_main "$case_dir" refreshed.txt refreshed
+  origin_head=$(git -C "$case_dir/origin.git" rev-parse refs/heads/main)
+  add_return_failure_treehouse_state "$case_dir" "$case_dir/wt" available '' 0
+  add_token_report_probe "$case_dir"
+  cat > "$case_dir/fakebin/tmux" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$case_dir/tmux.log"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  : > "$case_dir/tmux.log"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "already-returned: teardown should accept the attained return state"
+  assert_grep "already returned" "$case_dir/stderr" \
+    "already-returned: teardown did not explain the structured-state decision"
+  assert_grep "fm-token-report.sh --task task-x1" "$case_dir/token-report.log" \
+    "already-returned: token report hook did not run before record cleanup"
+  [ -s "$case_dir/tmux.log" ] \
+    || fail "already-returned: endpoint cleanup did not run"
+  git -C "$case_dir/project" merge-base --is-ancestor "$origin_head" main \
+    || fail "already-returned: project clone was not refreshed to the current default branch"
+  assert_grep "Backlog: task-x1 just finished" "$case_dir/stdout" \
+    "already-returned: backlog reminder did not run"
+  for artifact in meta status turn-ended check.sh pr-poll pr-poll-registration check-trust busy-gen busy-state; do
+    assert_absent "$case_dir/state/task-x1.$artifact" \
+      "already-returned: durable task record survived cleanup: $artifact"
+  done
+  pass "an already-returned worktree completes the full teardown lifecycle"
+}
+
+# (ad) A structured registry containing no entry for the target is not proof
+# that the target was returned. The failed return therefore preserves state.
+test_structured_unknown_worktree_still_aborts_teardown() {
+  local case_dir rc
+  case_dir=$(make_case structured-unknown-worktree)
+  write_meta "$case_dir" no-mistakes ship
+  : > "$case_dir/state/task-x1.turn-ended"
+  add_return_failure_treehouse_state \
+    "$case_dir" "$case_dir/some-other-pool-slot" available '' 0
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "structured-unknown: teardown must abort for an unknown worktree"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "structured-unknown: failed return erased task metadata"
+  assert_present "$case_dir/state/task-x1.turn-ended" \
+    "structured-unknown: failed return erased the turn-end record"
+  pass "an unknown worktree still aborts after structured-state inspection"
+}
+
+# (ae) A registry entry for the exact worktree is insufficient when another
+# holder still leases it. Teardown must not treat known as equivalent to free.
+test_leased_worktree_still_aborts_teardown() {
+  local case_dir rc
+  case_dir=$(make_case leased-worktree)
+  write_meta "$case_dir" no-mistakes ship
+  : > "$case_dir/state/task-x1.turn-ended"
+  add_return_failure_treehouse_state "$case_dir" "$case_dir/wt" leased other-crew 0
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] || fail "leased-worktree: teardown must abort while another holder owns the slot"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "leased-worktree: failed return erased task metadata"
+  assert_present "$case_dir/state/task-x1.turn-ended" \
+    "leased-worktree: failed return erased the turn-end record"
+  pass "a worktree leased to another holder still aborts with state intact"
+}
+
 # The alias tolerance must not reach past the landed-work gate: unlanded work in a
 # worktree named through the symlink is still refused before any return runs.
 test_symlinked_name_still_refuses_unlanded_work() {
@@ -2740,6 +2882,9 @@ test_run_abort_precedes_process_reap_precedes_worktree_removal
 test_recorded_physical_name_tears_down_against_logical_registration
 test_recorded_logical_name_tears_down_against_physical_registration
 test_unknown_worktree_still_aborts_teardown
+test_already_returned_worktree_completes_teardown
+test_structured_unknown_worktree_still_aborts_teardown
+test_leased_worktree_still_aborts_teardown
 test_symlinked_name_still_refuses_unlanded_work
 test_token_report_failure_never_blocks_teardown
 test_token_report_hang_never_delays_teardown

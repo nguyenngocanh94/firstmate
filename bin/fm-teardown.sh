@@ -96,6 +96,14 @@
 # resolves to the same directory. A path no name resolves for is still an
 # abort: unrecognized stays unrecognized, and no work is discarded on the way.
 #
+# Idempotent return: a previous teardown attempt or another authorized cleanup
+# may already have returned the exact worktree before this run reaches the return
+# step. After a failed return, teardown consults `treehouse status --json` and
+# accepts that failure only when every registry entry resolving to the worktree
+# reports status=available, an empty lease holder, and zero processes. An unknown,
+# leased, in-use, malformed, or unreadable state still aborts with task records
+# intact. The structured state is the authority; no vendor error text is matched.
+#
 # Pre-teardown cleanup sequence (runs once every landed/discard-work safety
 # refusal above has already passed, and BEFORE any worktree return, branch
 # delete, or backend kill below - a still-active run or a leaked process may
@@ -1050,6 +1058,46 @@ cleanup_stale_lock_for_safety_check() {
   return "$TEARDOWN_TREEHOUSE_LOCK_REFUSED"
 }
 
+# treehouse_worktree_already_returned <pool-dir> <path>: true only when the
+# structured treehouse registry reports that this exact filesystem location has
+# already reached the return target: available, unleased, and unused. Every
+# matching entry must agree, so duplicate or conflicting registry state fails
+# closed. Unknown paths and malformed or unreadable JSON are also false.
+treehouse_worktree_already_returned() {
+  local pool=$1 dir=$2 status_json candidate status lease_holder process_count
+  local match_count=0 returned_count=0
+  command -v jq >/dev/null 2>&1 || return 1
+  status_json=$( ( CDPATH='' cd -- "$pool" && treehouse status --json ) 2>/dev/null) || return 1
+  printf '%s' "$status_json" | jq -e '
+    type == "array" and all(.[];
+      type == "object"
+      and (.path | type == "string")
+      and (.status | type == "string")
+      and (.lease_holder | type == "string")
+      and (.processes | type == "array"))
+  ' >/dev/null 2>&1 || return 1
+
+  while IFS= read -r -d '' candidate \
+      && IFS= read -r -d '' status \
+      && IFS= read -r -d '' lease_holder \
+      && IFS= read -r -d '' process_count; do
+    fm_path_same_location "$candidate" "$dir" || continue
+    match_count=$(( match_count + 1 ))
+    if [ "$status" = available ] \
+      && [ -z "$lease_holder" ] \
+      && [ "$process_count" -eq 0 ]; then
+      returned_count=$(( returned_count + 1 ))
+    else
+      return 1
+    fi
+  done < <(printf '%s' "$status_json" | jq -j '
+    .[] | .path, "\u0000", .status, "\u0000", .lease_holder, "\u0000",
+    (.processes | length | tostring), "\u0000"
+  ')
+
+  [ "$match_count" -gt 0 ] && [ "$returned_count" -eq "$match_count" ]
+}
+
 # Return a worktree/home via `treehouse return --force`, tolerating a transient or
 # stale git index.lock left by a killed crew process, and tolerating a recorded
 # name that differs from the one treehouse registered for the same location. See
@@ -1067,11 +1115,15 @@ teardown_treehouse_return() {
     [ -n "$out" ] && printf '%s\n' "$out"
     return 0
   fi
-  [ -n "$out" ] && printf '%s\n' "$out" >&2
-
   if ! treehouse_return_is_index_lock_error "$out"; then
+    if treehouse_worktree_already_returned "$cd_dir" "$dir"; then
+      echo "teardown: $label $dir is already returned (treehouse reports available, unleased, and unused); continuing cleanup" >&2
+      return 0
+    fi
+    [ -n "$out" ] && printf '%s\n' "$out" >&2
     return 1
   fi
+  [ -n "$out" ] && printf '%s\n' "$out" >&2
 
   lock=$(worktree_git_lock_path "$dir") || lock=""
   if [ -n "$lock" ]; then
@@ -1094,12 +1146,16 @@ teardown_treehouse_return() {
       echo "teardown: $label return succeeded on retry; lock cleared on its own" >&2
       return 0
     fi
-    [ -n "$out" ] && printf '%s\n' "$out" >&2
-
     if ! treehouse_return_is_index_lock_error "$out"; then
+      if treehouse_worktree_already_returned "$cd_dir" "$dir"; then
+        echo "teardown: $label $dir is already returned after retry (treehouse reports available, unleased, and unused); continuing cleanup" >&2
+        return 0
+      fi
+      [ -n "$out" ] && printf '%s\n' "$out" >&2
       echo "teardown: $label return failed with a non-lock error after retry; aborting" >&2
       return 1
     fi
+    [ -n "$out" ] && printf '%s\n' "$out" >&2
   done
 
   # Refresh lock path after the patience window; it may have appeared, moved, or
@@ -1120,6 +1176,11 @@ teardown_treehouse_return() {
                  treehouse_return_is_index_lock_error 2>&1); then
         [ -n "$out" ] && printf '%s\n' "$out"
         echo "teardown: $label return succeeded after stale-lock cleanup" >&2
+        return 0
+      fi
+      if ! treehouse_return_is_index_lock_error "$out" \
+        && treehouse_worktree_already_returned "$cd_dir" "$dir"; then
+        echo "teardown: $label $dir is already returned after stale-lock cleanup (treehouse reports available, unleased, and unused); continuing cleanup" >&2
         return 0
       fi
       [ -n "$out" ] && printf '%s\n' "$out" >&2
