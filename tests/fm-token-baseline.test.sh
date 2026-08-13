@@ -472,22 +472,40 @@ TASK_STATE="$TASK_HOME/state"
 mkdir -p "$TASK_STATE"
 
 # pi: ~/.pi/agent/sessions/-<encoded-cwd>-/<ts>_<id>.jsonl
+#
+# The fixture directory names below are HARDCODED literals captured from a live
+# host's real ~/.pi/agent/sessions, deliberately NOT computed by any encoding
+# helper - a test that derives the expected name with the implementation's own
+# rule can only prove the code agrees with itself. Both cases carry a '.' in
+# the path (every firstmate worktree lives under .treehouse/, and pi's temp
+# worktrees carry a dotted suffix) because that is exactly where pi's rule
+# diverges from claude's: pi preserves '.' and '_', converts only '/', and
+# wraps with a double dash at each end.
 PI_ROOT="$TMP_ROOT/pi-sessions"
-PI_WT="/fixture/pi-task-wt"
-PI_ENCODED=$(printf '%s' "$PI_WT" | tr '/.' '--')
-mkdir -p "$PI_ROOT/-$PI_ENCODED-"
-jq -cn '{type:"session", id:"pisess1"}' > "$PI_ROOT/-$PI_ENCODED-/2026-08-12T00-00-00_pisess1.jsonl"
-jq -cn '{type:"message", timestamp:"2026-08-12T06:00:00.000Z",
-  message:{model:"pi-model", content:[],
-    usage:{input:10, cacheRead:5, cacheWrite:0, output:20, reasoning:0, totalTokens:35}}}' \
-  >> "$PI_ROOT/-$PI_ENCODED-/2026-08-12T00-00-00_pisess1.jsonl"
-write_task_meta "$TASK_STATE" pi-task pi "$PI_WT"
-PIJ=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_PI_SESSIONS="$PI_ROOT" \
-  "$LEDGER" --task pi-task --json 2>&1) || fail "pi --task resolution failed: $PIJ"
-[ "$(printf '%s' "$PIJ" | jq 'length')" = 1 ] \
-  || fail "pi --task resolution: want 1 call from the matching cwd-encoded directory, got $(printf '%s' "$PIJ" | jq 'length')"
-[ "$(printf '%s' "$PIJ" | jq -r '.[0].harness')" = pi ] \
-  || fail "pi --task resolution: resolved call must declare harness pi"
+PI_CASE=0
+while IFS='|' read -r PI_WT PI_DIR; do
+  [ -n "$PI_WT" ] || continue
+  PI_CASE=$((PI_CASE + 1))
+  PI_LOG="$PI_ROOT/$PI_DIR/2026-08-12T00-00-00_pisess$PI_CASE.jsonl"
+  mkdir -p "$PI_ROOT/$PI_DIR"
+  jq -cn --arg id "pisess$PI_CASE" '{type:"session", id:$id}' > "$PI_LOG"
+  jq -cn '{type:"message", timestamp:"2026-08-12T06:00:00.000Z",
+    message:{model:"pi-model", content:[],
+      usage:{input:10, cacheRead:5, cacheWrite:0, output:20, reasoning:0, totalTokens:35}}}' \
+    >> "$PI_LOG"
+  write_task_meta "$TASK_STATE" "pi-task-$PI_CASE" pi "$PI_WT"
+  PIJ=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_PI_SESSIONS="$PI_ROOT" \
+    "$LEDGER" --task "pi-task-$PI_CASE" --json 2>&1) \
+    || fail "pi --task resolution failed for the directory pi really wrote ($PI_DIR): $PIJ"
+  [ "$(printf '%s' "$PIJ" | jq 'length')" = 1 ] \
+    || fail "pi --task resolution: want 1 call from $PI_DIR, got $(printf '%s' "$PIJ" | jq 'length')"
+  [ "$(printf '%s' "$PIJ" | jq -r '.[0].harness')" = pi ] \
+    || fail "pi --task resolution: resolved call must declare harness pi"
+done <<'PI_CASES'
+/Users/erics/.treehouse/firstmate-47172b/3/firstmate|--Users-erics-.treehouse-firstmate-47172b-3-firstmate--
+/private/var/folders/k6/fqrkdyld1xzd5682_nw0rccc0000gn/T/fm-liveness-drift.eu7jXj/wt|--private-var-folders-k6-fqrkdyld1xzd5682_nw0rccc0000gn-T-fm-liveness-drift.eu7jXj-wt--
+PI_CASES
+[ "$PI_CASE" = 2 ] || fail "pi --task resolution: expected 2 observed-directory cases, ran $PI_CASE"
 
 # grok: ~/.grok/sessions/<url-encoded-cwd>/<session-id>/updates.jsonl
 GROK_ROOT="$TMP_ROOT/grok-sessions"

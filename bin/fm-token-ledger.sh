@@ -364,7 +364,11 @@ fm_ledger_resolve_task() {
   [ -n "$HARNESS" ] || HARNESS=$harness
   case "${HARNESS:-}" in
     ''|claude) HARNESS=claude; dir="$CLAUDE_PROJECTS/$(fm_token_encode "$wt")" ;;
-    pi|pi-signed) HARNESS=pi; dir="$PI_SESSIONS/-$(fm_token_encode "$wt")-" ;;
+    # pi's rule is its own, NOT claude's fm_token_encode: only '/' becomes '-'
+    # ('.' and '_' are preserved), the path is encoded as if it had a trailing
+    # slash, and one more literal '-' wraps each end - so
+    # /Users/erics/.treehouse/x/firstmate -> --Users-erics-.treehouse-x-firstmate--
+    pi|pi-signed) HARNESS=pi; dir="$PI_SESSIONS/-$(printf '%s' "$wt/" | tr '/' '-')-" ;;
     grok) dir="$GROK_SESSIONS/$(fm_ledger_url_encode "$wt")" ;;
     codex) fm_ledger_resolve_codex_task "$id" "$wt"; return $? ;;
     agy) warn "agy: no log surface exists (~/.agy, ~/.antigravity and ~/.config/agy are all absent) - task $id cannot be mapped to a session log; see --capabilities"; return 1 ;;
