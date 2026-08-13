@@ -253,8 +253,14 @@ With `-L` a symlink to a regular file is `-type f` and a symlink to a FIFO is `-
 The case instead uses a regular file the guards accept but that is slow to read.
 `awk 'FNR==1{...}'` must read a rollout's entire first line before it can decide anything, so a 200MB first line keeps the scan busy for several seconds against the case's 1-second bound.
 Measured on the development host (macOS, `awk version 20200816`, the slowest awk this repo runs on): the awk pass alone takes 2.89s and the full `fm-token-ledger.sh --task` resolve takes 4.33s, i.e. a margin of roughly 4x over the bound.
-Generating the fixture with the pipeline the case actually uses costs 7.76s and 7.81s wall across two runs plus 191MB of temporary disk, which the case removes as soon as teardown returns.
+Generating the fixture with the pipeline the case actually uses costs 7.76s and 7.81s wall across two runs.
 That cost is CPU-bound in BSD `tr`, so it does not vary with cache state - an earlier revision of this paragraph reported 0.4s, which came from a `python3` generator rather than the `head -c … | tr` pipeline in the test, and did not reproduce.
+
+Peak temporary disk is about 381MiB under `TMPDIR`, not the 191MiB an earlier revision claimed.
+The fixture is 191MiB, and the scan's own `firstlines_tmp` holds another 191MiB, because `awk 'FNR==1{print FILENAME "\t" $0; nextfile}'` writes that entire 200MB first line back out; both exist at once.
+The fixture's lifetime differs by branch.
+When the timeout fires it is removed as soon as teardown returns.
+On the skip path it is deliberately retained past teardown and read a second time, by an unbounded probe run of the reporter against a copy of the task metadata (`state-probe`, taken before cleanup removes the original), so the skip message can name the reporter's own runtime rather than teardown's total; only then is it removed.
 
 The margin depends entirely on which `awk` the host ships, so this is a throughput race rather than an absolute block, and the case is written to say so rather than to bet on it.
 CI runs this suite on `ubuntu-latest`, whose default `mawk` is materially faster on a single-record scan of this shape and may well finish inside the bound.

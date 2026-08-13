@@ -2851,11 +2851,19 @@ test_token_report_hang_never_delays_teardown() {
   # fast. It skips instead - loudly, naming what was not covered. The fixture is
   # deliberately NOT grown to buy margin: a bigger one only moves the threshold
   # on the same race, at the cost of temp disk and setup time on every run.
+  #
+  # The note's absence has two causes that must not be conflated. A host with no
+  # timeout/gtimeout/perl rung makes the hook skip the reporter outright, so no
+  # bound was ever applied and nothing about the race was measured; claiming
+  # anything "inside the 1s bound" there would be false.
   if grep -q "timed out after 1s" "$case_dir/stderr"; then
     [ "$elapsed" -lt 60 ] \
       || fail "token-report-hangs: cleanup took ${elapsed}s; a wedged reporter must be bounded, not merely eventually-finishing"
     rm -f "$slow"
     pass "a hanging token baseline report is bounded and never delays cleanup"
+  elif grep -q "no timeout mechanism available" "$case_dir/stderr"; then
+    rm -f "$slow"
+    echo "skip: this host ships none of timeout, gtimeout or perl, so the cleanup hook skipped the reporter rather than bounding it - no bound was applied and the timeout ladder was NOT exercised here (cleanup's exit-0 and record-removal guarantees were still checked above)"
   else
     # The host won the race, so report the number that is actually comparable to
     # the bound: the REPORTER's own runtime against this fixture. Teardown's

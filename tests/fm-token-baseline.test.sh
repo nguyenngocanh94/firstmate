@@ -812,7 +812,12 @@ REAL_LOOKBACK=5
 REAL_CODEX_ROOT="$HOME/.codex/sessions"
 REAL_CODEX_LOG=
 if [ -d "$REAL_CODEX_ROOT" ]; then
-  REAL_DAY_DIRS=$(find "$REAL_CODEX_ROOT" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort -r | head -n "$REAL_LOOKBACK")
+  # -L, -type f and -maxdepth mirror fm_ledger_resolve_codex_task exactly. This
+  # block reimplements production's window so it can pick a candidate
+  # independently, so any divergence makes the two disagree about which
+  # day-partitions are in scope - and that disagreement lands on the HARD-FAIL
+  # branch below, reddening the suite over a host condition rather than a defect.
+  REAL_DAY_DIRS=$(find -L "$REAL_CODEX_ROOT" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort -r | head -n "$REAL_LOOKBACK")
   if [ -n "$REAL_DAY_DIRS" ]; then
     REAL_DAY_ARR=()
     while IFS= read -r d; do [ -n "$d" ] && REAL_DAY_ARR+=("$d"); done <<EOF
@@ -820,7 +825,7 @@ $REAL_DAY_DIRS
 EOF
     REAL_FIRSTLINES="$TMP_ROOT/real-codex-firstlines.txt"
     # shellcheck disable=SC2016 # single-quoted intentionally: FILENAME and $0 are awk's own variables, not the shell's
-    find "${REAL_DAY_ARR[@]}" -maxdepth 1 -name 'rollout-*.jsonl' -print0 2>/dev/null \
+    find -L "${REAL_DAY_ARR[@]}" -maxdepth 1 -type f -name 'rollout-*.jsonl' -print0 2>/dev/null \
       | xargs -0 awk 'FNR==1{print FILENAME "\t" $0; nextfile}' > "$REAL_FIRSTLINES" 2>/dev/null
     # A session that was started and abandoned carries a session_meta and no
     # telemetry at all - an ordinary host condition, not a defect. The
@@ -857,7 +862,7 @@ if [ -n "${REAL_CODEX_LOG:-}" ] && [ -f "$REAL_CODEX_LOG" ]; then
     stat -f '%z %m' "$1" 2>/dev/null || stat -c '%s %Y' "$1" 2>/dev/null
   }
   real_codex_window() {
-    find "$REAL_CODEX_ROOT" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort -r | head -n "$REAL_LOOKBACK"
+    find -L "$REAL_CODEX_ROOT" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort -r | head -n "$REAL_LOOKBACK"
   }
   REAL_SIG_BEFORE=$(real_codex_sig "$REAL_CODEX_LOG")
   REAL_MATCH_COUNT=$(FM_STATE_OVERRIDE="$REAL_STATE" FM_CODEX_LOOKBACK_DAYS="$REAL_LOOKBACK" \
