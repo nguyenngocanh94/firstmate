@@ -2856,6 +2856,96 @@ test_token_report_codex_unmapped_never_blocks_teardown() {
   pass "an unmapped codex session never blocks or alters cleanup, and names the specific reason"
 }
 
+# write_claude_session <file> <requestid-count-shape>: a minimal real Claude
+# session log. Two records SHARE requestId r1, which is the ordinary shape of a
+# single API response written as several content blocks - so the ledger reports
+# diagnostic: duplicate_usage_records=1 on an otherwise perfect exit-0 run.
+write_claude_session() {
+  local f=$1 uuid parent
+  mkdir -p "$(dirname "$f")"
+  : > "$f"
+  local n=1
+  for uuid in u1 u2; do
+    [ "$n" = 1 ] && parent="" || parent=u1
+    jq -cn --arg uuid "$uuid" --arg parent "$parent" '{
+      type:"assistant", timestamp:"2026-08-12T06:00:00.000Z", uuid:$uuid,
+      parentUuid:(if $parent == "" then null else $parent end),
+      requestId:"r1", sessionId:"sess-teardown", isSidechain:false,
+      message:{ model:"claude-opus-5", content:[{type:"text"}],
+        usage:{ input_tokens:10, cache_creation_input_tokens:100,
+                cache_read_input_tokens:1000, output_tokens:50,
+                output_tokens_details:{thinking_tokens:0},
+                iterations:[{type:"message"}] } } }' >> "$f"
+    n=2
+  done
+}
+
+# A report that SUCCEEDS while the ledger prints its routine
+# duplicate_usage_records diagnostic must be reported as written, not as
+# skipped, and must not earn a note at all - that diagnostic is expected output
+# on any ordinary Claude session, so noting it would fire on effectively every
+# teardown and drown the two diagnostics that do mean something is wrong.
+test_token_report_routine_diagnostic_is_not_a_defect() {
+  local case_dir rc encoded report
+  command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; return 0; }
+  case_dir=$(make_case token-report-routine-diagnostic)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  encoded=$(printf '%s' "$case_dir/wt" | tr '/.' '--')
+  write_claude_session "$case_dir/claude-projects/$encoded/sess-teardown.jsonl"
+
+  set +e
+  FM_CLAUDE_PROJECTS="$case_dir/claude-projects" FM_DATA_OVERRIDE="$case_dir/data" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "token-report-routine-diagnostic: cleanup must succeed"
+  report="$case_dir/data/token-reports/task-x1.json"
+  [ -s "$report" ] \
+    || fail "token-report-routine-diagnostic: the report must actually be written to disk, $report is missing or empty"
+  jq -e '.totals.gross_tokens' "$report" >/dev/null \
+    || fail "token-report-routine-diagnostic: the written report must be usable JSON with totals"
+  ! grep -q "token baseline report skipped" "$case_dir/stderr" \
+    || fail "token-report-routine-diagnostic: a report that WAS written must never be announced as skipped: $(cat "$case_dir/stderr")"
+  ! grep -q "measurement defects" "$case_dir/stderr" \
+    || fail "token-report-routine-diagnostic: a routine duplicate_usage_records diagnostic must not be reported as a defect: $(cat "$case_dir/stderr")"
+  pass "a successful report carrying only routine diagnostics is neither announced as skipped nor flagged as defective"
+}
+
+# The other half of the same contract: a diagnostic that DOES mean the
+# measurement is incomplete must still surface, so narrowing the note cannot
+# silence the signals it exists for.
+test_token_report_defect_diagnostic_still_notes() {
+  local case_dir rc encoded
+  command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; return 0; }
+  case_dir=$(make_case token-report-defect-diagnostic)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  encoded=$(printf '%s' "$case_dir/wt" | tr '/.' '--')
+  write_claude_session "$case_dir/claude-projects/$encoded/sess-teardown.jsonl"
+  printf 'this line is not json\n' >> "$case_dir/claude-projects/$encoded/sess-teardown.jsonl"
+
+  set +e
+  FM_CLAUDE_PROJECTS="$case_dir/claude-projects" FM_DATA_OVERRIDE="$case_dir/data" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "token-report-defect-diagnostic: cleanup must succeed"
+  [ -s "$case_dir/data/token-reports/task-x1.json" ] \
+    || fail "token-report-defect-diagnostic: the report must still be written despite the dropped line"
+  assert_grep "measurement defects" "$case_dir/stderr" \
+    "token-report-defect-diagnostic: a dropped log line must still earn a note"
+  assert_grep "did not parse as JSON and were dropped" "$case_dir/stderr" \
+    "token-report-defect-diagnostic: the note must name the specific defect"
+  pass "a dropped log line still surfaces as a measurement defect on an otherwise successful report"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -2922,3 +3012,5 @@ test_symlinked_name_still_refuses_unlanded_work
 test_token_report_failure_never_blocks_teardown
 test_token_report_hang_never_delays_teardown
 test_token_report_codex_unmapped_never_blocks_teardown
+test_token_report_routine_diagnostic_is_not_a_defect
+test_token_report_defect_diagnostic_still_notes

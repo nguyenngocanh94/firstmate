@@ -80,6 +80,22 @@
 # would break the one-record-per-call identity, so it is reported and its token
 # fields are emitted as "unknown" rather than summed.
 #
+# STDERR CONTRACT - every consumer classifies on these markers, never on line
+# position, because the post-parse diagnostics below are emitted AFTER the
+# per-log loop and so can follow a failure reason:
+#   "diagnostic: <key>=<n>"   ROUTINE and expected. duplicate_usage_records is
+#                             nonzero on any ordinary Claude session; it means
+#                             the grouping contract did its job, not that
+#                             anything is wrong. Never treat this as a defect.
+#   "ASSERTION BROKEN: ..."   DEFECT. Call-level arithmetic was invalidated.
+#   "UNPARSED LINES: ..."     DEFECT. Log records were dropped, so the ledger
+#                             is measuring less than the session contains.
+#   anything else             A REASON: why this run, or one of its logs, could
+#                             not be read. This is what a caller folds into its
+#                             own summary.
+# A new routine per-runtime diagnostic must use the "diagnostic:" form so it
+# stays out of the defect set by default.
+#
 # Environment overrides (tests and unusual setups):
 #   FM_HOME / FM_ROOT_OVERRIDE   home and code root resolution (standard)
 #   FM_STATE_OVERRIDE            state dir (<id>.meta lookup)
@@ -981,7 +997,7 @@ fm_ledger_parse() {
   total=$(wc -l < "$log" | tr -d ' ')
   kept=$(jq -c . "$log" 2>/dev/null | wc -l | tr -d ' ')
   dropped=$(( total - kept ))
-  [ "$dropped" -le 0 ] || warn "$log: $dropped of $total lines did not parse as JSON and were dropped"
+  [ "$dropped" -le 0 ] || warn "UNPARSED LINES: $log: $dropped of $total lines did not parse as JSON and were dropped"
   jq -c . "$log" 2>/dev/null | jq -s \
     --arg task "$task" \
     --arg source_log "$log" \

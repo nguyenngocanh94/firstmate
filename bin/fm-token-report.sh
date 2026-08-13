@@ -138,17 +138,26 @@ else
   # ledger reports loudly on SUCCESS too - a dropped-line count, or an
   # ASSERTION BROKEN line meaning call-level arithmetic was invalidated - and
   # those are the diagnostics most worth seeing, so the success path relays all
-  # of them. On failure the LAST line is the specific reason, which the summary
-  # below folds in verbatim; relaying it here as well would print the same
-  # sentence twice into the teardown hook's combined capture, so the failure
-  # path relays everything EXCEPT that line and lets the summary carry it.
+  # of them.
+  #
+  # On failure the reason is the last line that is NOT one of the ledger's
+  # self-identifying diagnostic forms (see its STDERR CONTRACT). Position alone
+  # is not enough: the ledger runs its post-parse diagnostics loop AFTER the
+  # per-log loop, so a run that both failed on one log and reported a routine
+  # diagnostic on another ends with the diagnostic. Folding "whatever came last"
+  # would name a benign data-quality note as the cause of the failure. Only the
+  # one line the summary actually carries is withheld from the relay, so no
+  # diagnostic can be lost by being dropped without being restated.
   if [ "$LEDGER_RC" -ne 0 ]; then
-    sed '$d' "$LEDGER_ERR_TMP" >&2
-    # The ledger's own diagnostics already name the harness and the exact
-    # reason (unsupported runtime vs a supported one whose specific session
-    # could not be found); fold that reason into the summary so a reader never
-    # sees only the generic "could not be produced" phrase.
-    reason=$(tail -1 "$LEDGER_ERR_TMP" | sed 's/^fm-token-ledger: //')
+    reason_lineno=$(grep -nvE '^fm-token-ledger: (diagnostic: |ASSERTION BROKEN: |UNPARSED LINES: )' \
+      "$LEDGER_ERR_TMP" | tail -1 | cut -d: -f1)
+    if [ -n "$reason_lineno" ]; then
+      reason=$(sed -n "${reason_lineno}p" "$LEDGER_ERR_TMP" | sed 's/^fm-token-ledger: //')
+      sed "${reason_lineno}d" "$LEDGER_ERR_TMP" >&2
+    else
+      reason=
+      cat "$LEDGER_ERR_TMP" >&2
+    fi
     warn "the ledger could not be produced for $REPORT_ID${reason:+: $reason}"
     exit 1
   fi

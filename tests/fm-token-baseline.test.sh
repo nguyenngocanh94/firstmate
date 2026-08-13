@@ -614,11 +614,19 @@ for BIG_LOOKBACK in 36501 99999999999999999999; do
 done
 # Genuinely unparseable input is a DIFFERENT case and keeps the documented
 # 30-day default, so neither rejection can be over-applied to it. Leading zeros
-# are a formatting quirk of a perfectly valid number, not out-of-range input.
+# are a formatting quirk of a perfectly valid number, not out-of-range input:
+# the padding must be stripped BEFORE the range check, or the digit count alone
+# pushes a small number past the maximum. The padded value here is deliberately
+# wider than the maximum's own digit count, so it exercises that strip - a
+# narrower one like 0002 would pass whether or not the strip exists.
 [ "$(codex_sessions_at_lookback not-a-number)" = codexsess-match,codexsess-stale ] \
   || fail "codex --task resolution: a non-numeric lookback must fall back to the documented 30-day default, got: $(codex_sessions_at_lookback not-a-number)"
-[ "$(codex_sessions_at_lookback 0002)" = codexsess-match ] \
-  || fail "codex --task resolution: a zero-padded lookback must be read as its numeric value, got: $(codex_sessions_at_lookback 0002)"
+[ "$(codex_sessions_at_lookback 00000000002)" = codexsess-match ] \
+  || fail "codex --task resolution: a zero-padded lookback wider than the range bound must be read as its numeric value, got: $(codex_sessions_at_lookback 00000000002)"
+CODEX_PAD_ERR=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_ROOT" FM_CODEX_LOOKBACK_DAYS=00000000002 \
+  "$LEDGER" --task codex-task --json 2>&1 1>/dev/null)
+[ -z "$CODEX_PAD_ERR" ] \
+  || fail "codex --task resolution: a zero-padded lookback must not be rejected as out of range, got: $CODEX_PAD_ERR"
 pass "a codex lookback outside the supported range (0, negative or oversized) reports its own cause, while unparseable input still defaults to 30"
 
 # --- 12. unmapped runtimes name the SPECIFIC reason, not a generic phrase ----
@@ -705,6 +713,26 @@ FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$NOISY_ROOT" \
 grep -qF 'did not parse as JSON and were dropped' "$NOISY_REPORT_ERR" \
   || fail "the report must relay the ledger's success-path diagnostics, got: $(cat "$NOISY_REPORT_ERR")"
 pass "the report relays the ledger's diagnostics on a successful run instead of swallowing them"
+
+# On a FAILING run the report must fold the REAL reason, not whatever line the
+# ledger happened to print last. The ledger's post-parse diagnostics loop runs
+# AFTER its per-log loop, so a run that failed on one log and reported a routine
+# diagnostic on another ends with the diagnostic - and folding that would name a
+# benign data-quality note as the cause of the failure while also deleting it
+# from the relay. Two sessions reproduce exactly that ordering: a missing log
+# (the real reason) and a resolvable one carrying an unparsed line.
+FOLD_ERR="$TMP_ROOT/fold-err.txt"
+FM_STATE_OVERRIDE="$TASK_STATE" "$REPORT" --task-label folddemo --harness codex \
+  --session "$TMP_ROOT/definitely-missing.jsonl" --session "$NOISY_LOG" --stdout \
+  > /dev/null 2>"$FOLD_ERR" && fail "the report must fail when one of its session logs is missing"
+grep -qF 'could not be produced for folddemo: session log not found' "$FOLD_ERR" \
+  || fail "the report must fold the real failure reason, not a trailing diagnostic, got: $(cat "$FOLD_ERR")"
+grep -qF 'did not parse as JSON and were dropped' "$FOLD_ERR" \
+  || fail "a diagnostic the summary does not carry must still be relayed, got: $(cat "$FOLD_ERR")"
+FOLD_REASON_COUNT=$(grep -cF 'session log not found' "$FOLD_ERR")
+[ "$FOLD_REASON_COUNT" = 1 ] \
+  || fail "the folded reason must appear exactly once, saw it $FOLD_REASON_COUNT times in: $(cat "$FOLD_ERR")"
+pass "a failing report folds the real reason and still relays every diagnostic it does not carry"
 
 # --- 13. a genuinely real codex session, cross-checked against its own totals -
 #

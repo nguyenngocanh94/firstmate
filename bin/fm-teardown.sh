@@ -705,7 +705,7 @@ validate_pr_poll_cleanup() {
 # FM_TOKEN_REPORT_ON_TEARDOWN=0 disables it entirely.
 # FM_TOKEN_REPORT_TIMEOUT overrides the timeout in seconds (default 20).
 write_token_baseline_report() {
-  local state_dir=$1 id=$2 reporter timeout_s out report_path noise
+  local state_dir=$1 id=$2 reporter timeout_s out report_path defects
   [ "${FM_TOKEN_REPORT_ON_TEARDOWN:-1}" = 0 ] && return 0
   reporter="$SCRIPT_DIR/fm-token-report.sh"
   [ -x "$reporter" ] || return 0
@@ -735,16 +735,25 @@ write_token_baseline_report() {
   # stdout (the written report path) and stderr (the reporter's and the
   # ledger's diagnostics) are captured together above, so classify on whether a
   # report path was produced AT ALL rather than on what the first line happens
-  # to be. A report that succeeded while also warning - a dropped log line, an
-  # ASSERTION BROKEN - is a produced report, not a skip, and saying otherwise
-  # would tell the reader no measurement exists when one does.
+  # to be. A report that succeeded while also warning is a produced report, not
+  # a skip, and saying otherwise would tell the reader no measurement exists
+  # when one does.
+  #
+  # A produced report only earns a note when a diagnostic signals a genuine
+  # DEFECT. The set is defined positively, from the ledger's own stderr markers,
+  # so a new routine per-runtime diagnostic stays silent here by default: the
+  # routine "diagnostic: <key>=<n>" form is expected output (duplicate_usage_
+  # records is nonzero on any ordinary Claude session) and noting it every
+  # teardown would read as "this measurement is wrong" when nothing is, drowning
+  # the two signals that do mean that. Both notes are collapsed to a single line
+  # to keep this hook's one-line-on-stderr contract.
   if [ -n "$out" ]; then
     report_path=$(printf '%s\n' "$out" | grep -m1 '^/' || true)
-    noise=$(printf '%s\n' "$out" | grep -v '^/' || true)
+    defects=$(printf '%s\n' "$out" | grep -E 'ASSERTION BROKEN:|UNPARSED LINES:' || true)
     if [ -z "$report_path" ]; then
-      echo "note: token baseline report skipped for $id ($out)" >&2
-    elif [ -n "$noise" ]; then
-      echo "note: token baseline report written for $id with diagnostics ($noise)" >&2
+      echo "note: token baseline report skipped for $id ($(printf '%s' "$out" | tr '\n' ' '))" >&2
+    elif [ -n "$defects" ]; then
+      echo "note: token baseline report written for $id with measurement defects ($(printf '%s' "$defects" | tr '\n' ' '))" >&2
     fi
   fi
   return 0
