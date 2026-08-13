@@ -31,7 +31,10 @@
 #      One active-only exception covers the pipeline-owned window where its fix
 #      commits are not objects in the crew worktree: a same-branch run also
 #      matches when `active_steps` reports running/fixing with non-quiet recent
-#      activity and a fresh read-only `axi sync --check` reports pipeline_owned.
+#      activity and branch_sync reports pipeline_owned. That custody read comes
+#      from the branch_sync object `axi status` already returned, so the common
+#      case costs no extra process and no network; only a status answer that
+#      omits branch_sync falls back to a bounded read-only `axi sync --check`.
 #      Terminal, cancelled, parked, quiet, or activity-unknown runs still require
 #      the ordinary code-identity match.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
@@ -393,6 +396,15 @@ nm_coarse_head_matches_worktree() {  # <short-sha>
 # "unknown" when no activity timestamp exists. Accept only a running/fixing row
 # whose activity is neither condition; that is the CLI's own current liveness
 # signal, not a locally invented age threshold.
+#
+# The scan is bounded to the active_steps block. TOON nests a table's rows
+# deeper than its header, so the region ends at the first blank line, the first
+# line indented no deeper than the header, or the first nested key/table header -
+# never bleeding into a later table. That matters because `steps[N]{step,status,
+# findings,duration_ms}` rows have the same accepted shape (`review,fixing,0,
+# 120000`), so an unbounded scan would let a stale run whose only active_steps
+# row is quiet be attributed off the historical steps table when the CLI happens
+# to emit that table last.
 nm_run_has_recent_active_step() {
   local status outcome
   status=$(strip_quotes "$(nm_field status)")
@@ -400,18 +412,31 @@ nm_run_has_recent_active_step() {
   [ -z "$outcome" ] || return 1
   case "$status" in running|fixing|ci) ;; *) return 1 ;; esac
   printf '%s\n' "$RUN_OUT" | awk '
+    function indent_of(line) {
+      match(line, /^[[:space:]]*/)
+      return RLENGTH
+    }
     /^[[:space:]]*active_steps\[[0-9]+\]\{step,status,active_for,last_activity,agent_pid,round\}:[[:space:]]*$/ {
       in_active = 1
+      header_indent = indent_of($0)
       next
     }
     in_active {
+      if ($0 ~ /^[[:space:]]*$/ || indent_of($0) <= header_indent ||
+          $0 ~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(\[[0-9]+\](\{[^}]*\})?)?:([[:space:]]|$)/) {
+        in_active = 0
+        next
+      }
       row = $0
       sub(/^[[:space:]]+/, "", row)
       count = split(row, field, ",")
+      step_status = field[2]
+      sub(/^[[:space:]\"]+/, "", step_status)
+      sub(/[[:space:]\"]+$/, "", step_status)
       activity = field[4]
       sub(/^[[:space:]\"]+/, "", activity)
       sub(/[[:space:]\"]+$/, "", activity)
-      if (count >= 4 && (field[2] == "running" || field[2] == "fixing") &&
+      if (count >= 4 && (step_status == "running" || step_status == "fixing") &&
           activity != "" && activity != "unknown" && activity !~ /^quiet([[:space:]]|$)/) {
         found = 1
         exit
@@ -421,19 +446,55 @@ nm_run_has_recent_active_step() {
   '
 }
 
-# `axi sync --check` is the CLI's read-only branch-custody read. Its scoped
-# branch_sync.state is pipeline_owned only while the current branch remains in
-# pipeline custody; every blocked, terminal-recovery, and user-owned state is a
-# rejection here.
-nm_pipeline_owns_branch() {
-  local sync_out sync_state
-  sync_out=$(nm_run axi sync --check)
-  sync_state=$(printf '%s\n' "$sync_out" | sed -n '
-    /^[[:space:]]*branch_sync:[[:space:]]*$/,/^[^[:space:]]/ {
-      s/^[[:space:]]*state:[[:space:]]*//p
+# branch_sync.state out of one captured TOON answer ($1), bounded to the
+# branch_sync block: only a `state:` key at the block's own direct-child indent
+# counts, so a nested sub-object's `state:` (e.g. under next_action) and any
+# later sibling block's `state:` are never mistaken for custody.
+nm_branch_sync_state() {  # <toon-output>
+  local raw
+  raw=$(printf '%s\n' "$1" | awk '
+    function indent_of(line) {
+      match(line, /^[[:space:]]*/)
+      return RLENGTH
     }
-  ' | head -1)
-  sync_state=$(strip_quotes "$sync_state")
+    /^[[:space:]]*branch_sync:[[:space:]]*$/ {
+      in_sync = 1
+      header_indent = indent_of($0)
+      child_indent = -1
+      next
+    }
+    in_sync {
+      if ($0 ~ /^[[:space:]]*$/ || indent_of($0) <= header_indent) {
+        in_sync = 0
+        next
+      }
+      if (child_indent < 0) child_indent = indent_of($0)
+      if (indent_of($0) == child_indent && $0 ~ /^[[:space:]]*state:([[:space:]]|$)/) {
+        value = $0
+        sub(/^[[:space:]]*state:[[:space:]]*/, "", value)
+        print value
+        exit
+      }
+    }
+  ')
+  strip_quotes "$raw"
+}
+
+# Branch custody for the active-run exception. `axi status` already returns the
+# structured branch_sync object whenever it is relevant, so prefer the answer
+# already in hand: it is free, and it cannot be lost to a slow or unreachable
+# remote or refused because the crew worktree is dirty - either of which would
+# reintroduce the very "unknown - none" misattribution this exception fixes.
+# Only a status answer that carries no branch_sync at all falls back to the
+# CLI's own bounded read-only custody read, `axi sync --check`. Custody holds
+# only while state is pipeline_owned; every blocked, terminal-recovery, and
+# user-owned state is a rejection here.
+nm_pipeline_owns_branch() {
+  local sync_state
+  sync_state=$(nm_branch_sync_state "$RUN_OUT")
+  if [ -z "$sync_state" ]; then
+    sync_state=$(nm_branch_sync_state "$(nm_run axi sync --check)")
+  fi
   [ "$sync_state" = pipeline_owned ]
 }
 
