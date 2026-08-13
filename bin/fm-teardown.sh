@@ -740,7 +740,11 @@ write_token_baseline_report() {
   elif command -v gtimeout >/dev/null 2>&1; then
     report_path=$(gtimeout "$timeout_s" "$reporter" --task "$id") || rc=$?
   elif command -v perl >/dev/null 2>&1; then
-    report_path=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
+    # The exit mapping reports a signal-killed child as 128+signal, the same
+    # convention timeout(1) uses, instead of collapsing it to 0 the way a bare
+    # `$? >> 8` does - otherwise an operator's Ctrl-C or an external kill of the
+    # reporter arrives here indistinguishable from a clean success.
+    report_path=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $st = $?; exit($st & 127 ? 128 + ($st & 127) : $st >> 8)' \
       "$timeout_s" "$reporter" --task "$id") || rc=$?
   else
     echo "note: token baseline report skipped for $id (no timeout mechanism available)" >&2
@@ -755,15 +759,22 @@ write_token_baseline_report() {
   # duplicate_usage_records count look like a defect; whatever actually went
   # wrong has already said so on stderr above, in the reporter's own words.
   #
-  # The wording stays honest about what the reader will actually find above. A
-  # reporter killed by the bound never reached its own stderr relay, so there
-  # are no diagnostics to point at and the exit status is the whole story; every
-  # other failure may or may not have said something first. rc alone tells the
-  # two apart, so neither case needs the diagnostic text inspected.
+  [ "$rc" -eq 0 ] && [ -n "$report_path" ] && return 0
+  # No report exists, so say why in terms the reader can act on. Each arm is
+  # decided by rc alone - no diagnostic text is inspected - and each claims only
+  # what is true of its own case: a reporter killed by the bound or by any other
+  # signal never reached its own stderr relay, so there is nothing above to
+  # point at, whereas an ordinary nonzero exit usually did say something first.
+  # The last arm is a clean exit with no path on stdout, which is a contract
+  # violation by the reporter rather than a diagnosed failure.
   if [ "$rc" = 124 ]; then
     echo "note: token baseline report skipped for $id (timed out after ${timeout_s}s and was killed before it could report why)" >&2
-  elif [ "$rc" -ne 0 ] || [ -z "$report_path" ]; then
+  elif [ "$rc" -gt 128 ]; then
+    echo "note: token baseline report skipped for $id (killed by signal $((rc - 128)) before it could report why)" >&2
+  elif [ "$rc" -ne 0 ]; then
     echo "note: token baseline report skipped for $id (reporter exit $rc; any diagnostics it produced are above)" >&2
+  else
+    echo "note: token baseline report skipped for $id (the reporter exited cleanly but printed no report path)" >&2
   fi
   return 0
 }

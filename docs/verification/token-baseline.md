@@ -237,15 +237,20 @@ Exact totals are pinned only at the recorded assistant-record count.
 Its reference cross-check self-skips when the captain's logs are absent, so the suite stays runnable on any host.
 It additionally covers pi and grok `--task` resolution against synthesized fixtures matching their documented cwd-encoding, codex `--task` resolution including the day-partition lookback bound, the three unmapped-runtime reasons being textually distinct, and the real codex cross-check described above.
 
-`tests/fm-teardown.test.sh` gains three fail-open cases: a reporter that genuinely fails (an empty session-log root, so the ledger cannot resolve a log), one that genuinely hangs (a rollout-shaped FIFO in a codex day-partition, which nothing ever writes to), and one where a codex task's session genuinely cannot be mapped (an empty codex session root).
+`tests/fm-teardown.test.sh` gains three fail-open cases: a reporter that genuinely fails (an empty session-log root, so the ledger cannot resolve a log), one that is genuinely still working when the bound fires (a rollout whose first line is 200MB), and one where a codex task's session genuinely cannot be mapped (an empty codex session root).
 All three assert cleanup still exits 0, still removes every durable task record, the hang case completes within a bound, and the codex case surfaces its specific reason on stderr.
 
-Where the FIFO sits is load-bearing, and it was wrong at first.
-The claude and pi glob paths filter candidates with `[ -f "$f" ]`, which is false for a FIFO, so a FIFO placed there is skipped and the reporter fails in about 0 seconds - the case passed while exercising nothing, and was indistinguishable from the plain-failure case beside it.
-That filter is a real protection against production opening non-regular files and was left exactly as it is.
-Codex resolution instead scans day-partitions with `find -name '*.jsonl' | xargs awk`, which opens whatever the glob matches, so a FIFO there wedges the ledger inside its genuine read path against unmodified production code.
-Measured directly under a 3-second bound: the reporter blocked and was killed with exit 124 after about 4 seconds, where the claude-path FIFO returned in 0.
-The case now asserts both bounds - elapsed at least the timeout, so a regression back to not-blocking fails loudly, and under 60 seconds, so the bound itself still holds - and that the note names the timeout.
+How that middle case is built is load-bearing, and it took three tries to get honest.
+It first used a FIFO on the claude path, where `[ -f "$f" ]` is false for a FIFO, so the file was skipped and the reporter failed in about 0 seconds - the case passed while exercising nothing.
+It then moved the FIFO to a codex day-partition, which did block, because that scan piped `find -name '*.jsonl'` straight into `awk` with no `-type f` and so opened whatever the glob matched.
+That worked only because the codex path lacked the regular-file guard the other three runtimes have, which is a real inconsistency rather than a useful property: a FIFO or device node named `*.jsonl` under `~/.codex/sessions/YYYY/MM/DD/` would have been opened and read by production.
+The guard is now present on all four paths, and the hang case no longer depends on its absence.
+
+The case instead uses a regular file the guards accept but that is slow to read.
+`awk 'FNR==1{...}'` must read a rollout's entire first line before it can decide anything, so a 200MB first line keeps the scan busy for roughly 5 seconds against the case's 1-second bound.
+Measured on the development host, twice: exit 124 with the fixture costing about 0.4 seconds to generate and 191MB of temporary disk, which the case removes as soon as teardown returns.
+The margin is roughly 5x, so the read would have to get about five times faster before the case stopped crossing the bound.
+That is a timing-based rather than an absolute block, and the assertion is written to say so: if the timeout note ever goes missing the failure message states that the fixture stopped outrunning the timeout and must grow, rather than implying the bound is fine.
 It gains two further cases covering how the hook classifies a report it did produce.
 The hook captures only the reporter's stdout - the report path, and nothing else - and leaves its stderr attached, so every relayed diagnostic reaches the raw log exactly once and the captain-facing note is decided from the reporter's exit status and that path alone, never from diagnostic text.
 One case proves a successful report whose ledger emitted the routine `duplicate_usage_records` count still writes its JSON, shows that count on stderr, and earns no note; the other proves a dropped log line reaches stderr the same way without turning a produced report into a skip.

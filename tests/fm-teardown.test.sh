@@ -2788,55 +2788,57 @@ test_token_report_failure_never_blocks_teardown() {
 }
 
 test_token_report_hang_never_delays_teardown() {
-  local case_dir rc fifo started elapsed unblock
+  local case_dir rc slow started elapsed
+  command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; return 0; }
   case_dir=$(make_case token-report-hangs)
   write_meta "$case_dir" local-only ship
   printf 'harness=codex\n' >> "$case_dir/state/task-x1.meta"
   wt_commit "$case_dir" "fix the thing"
   add_fork_with_pushed_branch "$case_dir"
 
-  # A FIFO makes the reporter block for real: nothing ever writes the other end,
-  # so the open never returns. It has to sit where the ledger will actually open
-  # it. The claude/pi glob path filters candidates with `[ -f ]`, which is FALSE
-  # for a FIFO - so a FIFO there is silently skipped and the reporter fails in
-  # 0s, proving nothing about the bound. That filter is a real protection and
-  # must not be loosened for a test's benefit. Codex resolution instead scans
-  # day-partitions with `find -name '*.jsonl' | xargs awk`, which opens whatever
-  # the glob matches - so a rollout-shaped FIFO in a day-partition wedges the
-  # ledger inside its genuine read path, with production code untouched.
-  fifo="$case_dir/hang-codex/2026/08/12/rollout-wedged.jsonl"
-  mkdir -p "$(dirname "$fifo")"
-  mkfifo "$fifo" 2>/dev/null || { echo "skip: mkfifo unavailable"; return 0; }
+  # The reporter has to be still working when the bound fires, and it has to get
+  # there through the ledger's real read path against unmodified production
+  # code. A FIFO cannot do it: every runtime path now refuses non-regular files
+  # (`[ -f "$f" ]` on claude/pi/grok, `-type f` on the codex scan), so a FIFO is
+  # skipped and the reporter fails in ~0s, proving nothing. Those guards are a
+  # real protection and must not be loosened for a test's benefit.
+  #
+  # A regular file that is simply slow to read does reach it. Codex resolution
+  # scans day-partitions with `awk 'FNR==1{...}'`, which must read a rollout's
+  # entire first line before it can decide anything, so one rollout whose first
+  # line is 200MB keeps that scan busy for several seconds. Measured on the
+  # development host: ~5s of scanning against the 1s bound below, i.e. the read
+  # has to get about 5x faster than it is before this case stops crossing it.
+  slow="$case_dir/hang-codex/2026/08/12/rollout-slow.jsonl"
+  mkdir -p "$(dirname "$slow")"
+  { printf '{"type":"session_meta","payload":{"id":"slow","pad":"'
+    head -c 200000000 /dev/zero 2>/dev/null | tr '\0' a
+    printf '","cwd":"/nowhere-this-task-ever-ran"}}\n'
+  } > "$slow" 2>/dev/null
+  [ "$(wc -c < "$slow" 2>/dev/null || echo 0)" -gt 100000000 ] \
+    || { echo "skip: could not build the large rollout this case needs to outlast the timeout"; rm -f "$slow"; return 0; }
 
   started=$(date +%s)
   set +e
   FM_CODEX_SESSIONS="$case_dir/hang-codex" \
-  FM_TOKEN_REPORT_TIMEOUT=2 \
+  FM_TOKEN_REPORT_TIMEOUT=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
   elapsed=$(( $(date +%s) - started ))
+  rm -f "$slow"
 
   expect_code 0 "$rc" "token-report-hangs: cleanup must succeed when the reporter wedges"
   assert_absent "$case_dir/state/task-x1.meta" \
     "token-report-hangs: cleanup must still remove the task metadata"
-  # Both bounds matter. Under the timeout it must genuinely have blocked, or the
-  # case has degenerated into the plain-failure case next to it and the ladder
-  # is untested; over it, the bound did not hold.
-  [ "$elapsed" -ge 2 ] \
-    || fail "token-report-hangs: cleanup returned in ${elapsed}s, so the reporter never actually blocked - this case is not exercising the timeout"
+  # This is the assertion that makes the case worth having: only a reporter that
+  # was still running when the bound fired produces the timeout note. If it ever
+  # fails, the fixture stopped outrunning the timeout on this host and needs to
+  # grow - it does NOT mean the bound is fine.
+  assert_grep "timed out after 1s" "$case_dir/stderr" \
+    "token-report-hangs: the timeout note is absent, so the reporter finished before the bound and this case is no longer exercising the timeout ladder"
   [ "$elapsed" -lt 60 ] \
     || fail "token-report-hangs: cleanup took ${elapsed}s; a wedged reporter must be bounded, not merely eventually-finishing"
-  assert_grep "timed out after 2s" "$case_dir/stderr" \
-    "token-report-hangs: the note must name the timeout rather than an anonymous failure"
-  # Release any reader the kill left blocked on open, then unlink. Opening a
-  # FIFO for write blocks until a reader appears, so the opener is backgrounded
-  # and killed if none does - bounded either way, with no process left behind.
-  ( exec 9>"$fifo" ) 2>/dev/null & unblock=$!
-  sleep 1
-  kill "$unblock" 2>/dev/null || true
-  wait "$unblock" 2>/dev/null || true
-  rm -f "$fifo"
   pass "a hanging token baseline report is bounded and never delays cleanup"
 }
 
