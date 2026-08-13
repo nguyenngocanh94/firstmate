@@ -391,8 +391,18 @@ fm_ledger_resolve_task() {
 # from a nearby session.
 fm_ledger_resolve_codex_task() {
   local id=$1 wt=$2 lookback=${FM_CODEX_LOOKBACK_DAYS:-30}
-  local day_dirs day day_arr firstlines_tmp pattern f found=0 cwd
-  case "$lookback" in ''|*[!0-9]*) lookback=30 ;; esac
+  local day_dirs day day_arr firstlines_tmp pattern f found=0 cwd magnitude
+  # "not a number at all" and "a number, but out of range" are different
+  # inputs and get different answers: the former falls back to the documented
+  # default, the latter is rejected by name below. A negative value is a
+  # NUMBER, so it must reach that rejection rather than be swept into the
+  # default here - silently widening a below-minimum request to a 30-day scan
+  # is both wrong and the more expensive direction.
+  case "$lookback" in
+    -*) magnitude=${lookback#-}
+        case "$magnitude" in ''|*[!0-9]*) lookback=30 ;; esac ;;
+    ''|*[!0-9]*) lookback=30 ;;
+  esac
   # A window below one day is a caller configuration error, not a scan that
   # found nothing: `head -n 0` is rejected outright by BSD/macOS head and
   # returns an empty window on GNU head, so without this the platform decides

@@ -568,21 +568,34 @@ CODEXJ3=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_ROOT" FM_COD
   || fail "codex --task resolution: the stale rollout must contribute an observable call once inside the window, got $(printf '%s' "$CODEXJ3" | jq 'length')"
 pass "codex --task resolution finds the exact cwd match, and the day-partition bound is what excludes the equally-matching 2020 rollout"
 
-# A window below one day scans nothing at all. That is a caller configuration
+# Any window below one day scans nothing at all. That is a caller configuration
 # error, so it must name itself as one - not leak a raw `head: illegal line
 # count -- 0` from the shell, and not claim the partitions are missing when
-# three of them plainly exist.
-CODEXERR=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_ROOT" FM_CODEX_LOOKBACK_DAYS=0 \
-  "$LEDGER" --task codex-task --json 2>&1 1>/dev/null)
-printf '%s\n' "$CODEXERR" | grep -qF 'FM_CODEX_LOOKBACK_DAYS=0 scans no day-partitions at all' \
-  || fail "codex --task resolution: a zero-day lookback must name itself as the reason, got: $CODEXERR"
-if printf '%s\n' "$CODEXERR" | grep -qF 'no session day-partitions under'; then
-  fail "codex --task resolution: a zero-day lookback must not claim the day-partitions are missing, got: $CODEXERR"
-fi
-if printf '%s\n' "$CODEXERR" | grep -qi 'illegal line count'; then
-  fail "codex --task resolution: a zero-day lookback must not leak a raw head(1) error, got: $CODEXERR"
-fi
-pass "a zero-day codex lookback reports its own cause instead of leaking a shell error"
+# three of them plainly exist. A NEGATIVE window is a number that is out of
+# range, not unparseable input, so it must land on that same named rejection
+# rather than being swept into the 30-day default - silently widening a
+# below-minimum request is both wrong and the more expensive direction.
+for BAD_LOOKBACK in 0 -1; do
+  CODEXERR=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_ROOT" FM_CODEX_LOOKBACK_DAYS="$BAD_LOOKBACK" \
+    "$LEDGER" --task codex-task --json 2>&1 1>/dev/null)
+  CODEXOUT=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_ROOT" FM_CODEX_LOOKBACK_DAYS="$BAD_LOOKBACK" \
+    "$LEDGER" --task codex-task --json 2>/dev/null)
+  printf '%s\n' "$CODEXERR" | grep -qF "FM_CODEX_LOOKBACK_DAYS=$BAD_LOOKBACK scans no day-partitions at all" \
+    || fail "codex --task resolution: a lookback of $BAD_LOOKBACK must name itself as the reason, got: $CODEXERR"
+  [ -z "$CODEXOUT" ] \
+    || fail "codex --task resolution: a lookback of $BAD_LOOKBACK must resolve nothing rather than widening to the default, got: $CODEXOUT"
+  if printf '%s\n' "$CODEXERR" | grep -qF 'no session day-partitions under'; then
+    fail "codex --task resolution: a lookback of $BAD_LOOKBACK must not claim the day-partitions are missing, got: $CODEXERR"
+  fi
+  if printf '%s\n' "$CODEXERR" | grep -qi 'illegal line count'; then
+    fail "codex --task resolution: a lookback of $BAD_LOOKBACK must not leak a raw head(1) error, got: $CODEXERR"
+  fi
+done
+# Genuinely unparseable input is a DIFFERENT case and keeps the documented
+# 30-day default, so the rejection above cannot be over-applied to it.
+[ "$(codex_sessions_at_lookback not-a-number)" = codexsess-match,codexsess-stale ] \
+  || fail "codex --task resolution: a non-numeric lookback must fall back to the documented 30-day default, got: $(codex_sessions_at_lookback not-a-number)"
+pass "a below-minimum codex lookback (0 or negative) reports its own cause, while unparseable input still defaults to 30"
 
 # --- 12. unmapped runtimes name the SPECIFIC reason, not a generic phrase ----
 #
@@ -718,7 +731,19 @@ if [ -n "${REAL_CODEX_LOG:-}" ] && [ -f "$REAL_CODEX_LOG" ]; then
   write_task_meta "$REAL_STATE" real-codex-task codex "$REAL_WT"
   REAL_MATCH_COUNT=$(FM_STATE_OVERRIDE="$REAL_STATE" FM_CODEX_LOOKBACK_DAYS="$REAL_LOOKBACK" \
     "$LEDGER" --task real-codex-task --json 2>/dev/null | jq '[.[].session_id] | unique | length')
-  if [ "${REAL_MATCH_COUNT:-0}" != 1 ]; then
+  # 0 and >1 mean opposite things and must not share a branch. Discovery above
+  # already PROVED, with its own independent jq parse, that this rollout
+  # records this cwd inside this window - so 0 (or a count the ledger could not
+  # even produce) means --task resolution failed to find a session the test
+  # knows is there, which is the exact regression this cross-check exists to
+  # catch and must be loud. Only >1 is the benign reused-pool-slot condition.
+  case "${REAL_MATCH_COUNT:-}" in
+    ''|*[!0-9]*)
+      fail "real codex session: the ledger produced no usable session count for worktree $REAL_WT (discovered via $REAL_CODEX_LOG) - --task resolution failed outright" ;;
+  esac
+  if [ "$REAL_MATCH_COUNT" -eq 0 ]; then
+    fail "real codex session: $REAL_CODEX_LOG records cwd $REAL_WT within the last $REAL_LOOKBACK day-partitions, but the ledger's --task resolution found no session for it - the codex resolution path is broken"
+  elif [ "$REAL_MATCH_COUNT" -ne 1 ]; then
     # The exact-total cross-check below reads ONE file's own running total, so
     # it only applies when exactly one session matched; more than one (a
     # reused pool slot, still within this narrow window) is skipped rather
