@@ -216,6 +216,22 @@ $ FM_STATE_OVERRIDE=<tmp>/state bin/fm-token-ledger.sh --task codex-nomatch --js
 fm-token-ledger: codex: no session log matches worktree /some/worktree/that/never/existed for task codex-nomatch within the last 30 day-partitions under /Users/erics/.codex/sessions
 ```
 
+## pi and grok `--task` encodings, read from real session directories
+
+The pi and grok resolution paths predate this work but had no test at all, so their encodings were confirmed against this host's real session roots on 2026-08-14 rather than against the test's own assumption:
+
+```console
+$ ls ~/.pi/agent/sessions | head -1
+--Users-erics-.treehouse-firstmate-47172b-3-firstmate--
+$ ls ~/.grok/sessions | head -1
+%2FUsers%2Ferics%2F.treehouse%2Fpersonal-finance-vault-7f5fcd%2F1%2Fpersonal-finance-vault
+```
+
+pi's rule is its own and is **not** claude's `fm_token_encode`: only `/` becomes `-`, `.` and `_` survive (`.treehouse` above, which `fm_token_encode` would have flattened), the path is encoded as if it carried a trailing slash, and one further literal `-` wraps each end.
+A fixture built from claude's encoding would have matched nothing here, which is what makes reading the real directory - not the test - the evidence.
+grok's is a plain percent-encoding of the absolute path.
+The rules themselves are owned by `bin/fm-token-ledger.sh`'s resolution code and the comment above it.
+
 ## Suites
 
 ```console

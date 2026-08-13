@@ -52,10 +52,18 @@
 # Fail-open contract: this script is invoked from task cleanup
 # (bin/fm-teardown.sh) BEFORE task metadata is cleared, because the metadata is
 # gone afterwards while the session log survives. Cleanup must never be blocked,
-# delayed, or altered by it. Teardown therefore runs it under a timeout with its
-# failure discarded; this script keeps its side of the bargain by writing the
-# report atomically (temp file + mv) so an interrupted run cannot leave a
-# half-written report behind.
+# delayed, or altered by it. Teardown therefore runs it under a timeout and
+# never propagates its failure; this script keeps its side of the bargain by
+# writing the report atomically (temp file + mv) so an interrupted run cannot
+# leave a half-written report behind.
+#
+# The stdout/stderr split is part of that bargain and is load-bearing: on the
+# write path stdout carries EXACTLY the report path and nothing else, while
+# every diagnostic - this script's own warnings plus the ledger's, which it
+# relays verbatim - goes to stderr. Teardown captures only stdout and decides
+# its note from the exit status and that path, never from diagnostic text, so
+# anything else printed on stdout would make a written report unreadable to its
+# one caller.
 #
 # Environment overrides (tests and unusual setups): as bin/fm-token-ledger.sh,
 # plus FM_DATA_OVERRIDE for the report directory.

@@ -155,9 +155,11 @@ A hard bug can cost many tokens for a few lines, so it is not a headline measure
 The ordering matters: a session log outlives cleanup, but the metadata the report needs for its identity - harness, model, worktree, PR, delivery mode - does not.
 
 That hook is **strictly fail-open**.
-Measurement never influences cleanup: the reporter runs under a hard timeout, every failure is discarded to one stderr note, and cleanup always proceeds.
+Measurement never influences cleanup: the reporter runs under a hard timeout, no failure propagates, and cleanup always proceeds.
+The hook adds at most one note of its own, and decides it from the reporter's exit status and whether a report path was printed rather than from any diagnostic text, so a report that was written is never announced as skipped.
+The reporter's own stderr stays attached rather than being swallowed, so its warnings and the ledger diagnostics it relays - including the specific reason a task could not be mapped to a session log - reach the raw log unfiltered; a routine diagnostic there is not a failure.
 Reports are published atomically, so an interrupted run leaves the previous report intact rather than a half-written one.
-`tests/fm-teardown.test.sh` proves cleanup completes both when the reporter fails and when it hangs.
+`tests/fm-teardown.test.sh` proves cleanup completes when the reporter fails, when it is still working as the bound fires, and when the task's session cannot be mapped at all.
 
 Set `FM_TOKEN_REPORT_ON_TEARDOWN=0` to disable it, or `FM_TOKEN_REPORT_TIMEOUT` to change the bound.
 

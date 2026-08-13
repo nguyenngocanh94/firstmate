@@ -66,9 +66,13 @@
 #   --session <log>  a session log path (repeatable). The harness is detected
 #                    from the path unless --harness is given.
 #   --task <id>      resolve the session logs for a firstmate task from
-#                    state/<id>.meta (worktree= plus harness=), using the shared
-#                    attribution encoding in bin/fm-token-attrib-lib.sh. Also
-#                    stamps task_id on every record.
+#                    state/<id>.meta (worktree= plus harness=). The mapping is
+#                    per runtime: claude uses the shared attribution encoding in
+#                    bin/fm-token-attrib-lib.sh, pi and grok their own cwd
+#                    encodings, and codex - which has no cwd-encoded directory -
+#                    a bounded scan of each rollout's own session_meta.payload.cwd
+#                    (see fm_ledger_resolve_codex_task). Also stamps task_id on
+#                    every record.
 #   --harness <h>    force the parser: claude|pi|codex|grok
 #   --json           print a JSON array instead of JSONL
 #   --capabilities   print the per-runtime capability declaration and exit
