@@ -342,6 +342,27 @@ run:
 EOF
 }
 
+# An active pipeline fix round, as `axi status` emits it while the pipeline is
+# working on the crew's branch: an `active_steps` table carrying the CLI's own
+# freshness verdict in last_activity ("quiet ..." past its quiet warning,
+# "unknown" with no activity timestamp at all).
+run_active_fix_round() {  # <branch> <last-activity>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: fixing
+  head: "${FM_FAKE_RUN_HEAD:-abc1234}"
+  pr: ""
+  findings: none
+  steps[2]{step,status,findings,duration_ms}:
+    intent,completed,0,0
+    review,fixing,0,120000
+  active_steps[1]{step,status,active_for,last_activity,agent_pid,round}:
+    review,fixing,2m0s,"$2",12345,fix 2
+EOF
+}
+
 # ---------------------------------------------------------------------------
 # (a) active run-step is authoritative
 test_active_run_is_authoritative() {
@@ -1309,6 +1330,69 @@ test_missing_run_head_falls_back_to_current_state() {
   pass "missing run head falls back instead of matching by branch"
 }
 
+# The active-only attribution exception. During a pipeline fix round the run
+# head exists only in the pipeline's isolated copy, so the crew worktree cannot
+# resolve it as an object and code identity can never match. An active step with
+# the CLI's own non-quiet freshness verdict, on a run for this crew's branch, is
+# by itself enough to attribute the run - no branch-custody proof, and no extra
+# CLI call beyond the `axi status` answer already read.
+test_active_recent_run_with_unknown_head_is_current() {
+  reset_fakes
+  local d out unknown_head
+  d=$(new_case active-unknown-head)
+  make_repo_on_branch "$d/wt" fm/feat-active
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/active.meta" "window=fm:fm-active" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'resolved: pipeline review resumed\n' > "$d/state/active.status"
+  arm_idle_record "$d/state" active
+  unknown_head=1111111111111111111111111111111111111111
+  git -C "$d/wt" cat-file -e "${unknown_head}^{commit}" 2>/dev/null \
+    && fail "fixture run head unexpectedly exists in the crew worktree"
+  FM_FAKE_RUN_HEAD=$unknown_head
+  FM_FAKE_AXI_STATUS=$(run_active_fix_round fm/feat-active '3s ago: agent output')
+  out=$(run_crew_state "$d" active)
+  assert_contains "$out" "state: working" "recent active step -> working"
+  assert_contains "$out" "source: run-step" "recent active step -> run-step source"
+  assert_contains "$out" "validating (fixing)" "attributed run reports its step"
+  pass "active, recently-live run is attributed without a local run-head object"
+}
+
+# The anti-misattribution twin: branches are reused across runs, so a run with
+# no live step - terminal, or active but past the CLI's own quiet warning - must
+# still require the ordinary code-identity match rather than riding on the
+# branch name.
+test_terminal_or_stale_run_with_unknown_head_is_not_current() {
+  reset_fakes
+  local d out dt outt
+  d=$(new_case stale-unknown-head)
+  make_repo_on_branch "$d/wt" fm/feat-stale
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/stale.meta" "window=fm:fm-stale" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'resolved: old pipeline decision closed\n' > "$d/state/stale.status"
+  arm_idle_record "$d/state" stale
+  FM_FAKE_RUN_HEAD=2222222222222222222222222222222222222222
+  FM_FAKE_AXI_STATUS=$(run_active_fix_round fm/feat-stale 'quiet 12m0s ago: step log updated')
+  out=$(run_crew_state "$d" stale)
+  assert_not_contains "$out" "source: run-step" "a quiet step is not a liveness signal"
+  assert_contains "$out" "state: unknown" "stale run falls through to current-state sources"
+  assert_contains "$out" "source: none" "stale run is not attributed by branch name alone"
+
+  reset_fakes
+  dt=$(new_case terminal-unknown-head)
+  make_repo_on_branch "$dt/wt" fm/feat-terminal
+  make_fakebin "$dt" >/dev/null
+  fm_write_meta "$dt/state/terminal.meta" "window=fm:fm-terminal" "worktree=$dt/wt" "kind=ship" "harness=claude"
+  printf 'resolved: old pipeline decision closed\n' > "$dt/state/terminal.status"
+  arm_idle_record "$dt/state" terminal
+  FM_FAKE_RUN_HEAD=3333333333333333333333333333333333333333
+  FM_FAKE_AXI_STATUS=$(run_passed fm/feat-terminal)
+  outt=$(run_crew_state "$dt" terminal)
+  assert_not_contains "$outt" "source: run-step" "terminal unknown-head run must not use run-step"
+  assert_contains "$outt" "state: unknown" "terminal run falls through to current-state sources"
+  assert_contains "$outt" "source: none" "terminal run is not attributed by branch name alone"
+  pass "terminal or stale same-branch run still requires local code identity"
+}
+
 test_active_run_is_authoritative
 test_stale_needs_decision_superseded
 test_stale_blocked_superseded
@@ -1358,5 +1442,7 @@ test_historical_same_branch_rewritten_head_not_current
 test_active_run_descendant_fix_head_remains_current
 test_local_advanced_past_run_head_invalidates
 test_missing_run_head_falls_back_to_current_state
+test_active_recent_run_with_unknown_head_is_current
+test_terminal_or_stale_run_with_unknown_head_is_not_current
 
 echo "all fm-crew-state tests passed"
