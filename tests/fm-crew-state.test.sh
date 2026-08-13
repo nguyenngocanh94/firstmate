@@ -428,6 +428,29 @@ branch_sync:
 EOF
 }
 
+# A TOON table declares its own columns in the `{...}` header, and a quoted
+# value may contain the comma delimiter. This fixture exercises both at once:
+# `status` sits after `last_activity`, and `last_activity` carries an embedded
+# comma, so any reader that assumes fixed column positions or splits on every
+# comma reads the wrong column. The CLI documents `agent_pid` as present only
+# while a subprocess agent runs, so the column set is not a fixed shape.
+run_pipeline_owned_active_reordered_columns() {  # <branch> <last-activity>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: fixing
+  head: "${FM_FAKE_RUN_HEAD:-abc1234}"
+  pr: ""
+  findings: none
+  active_steps[1]{step,active_for,last_activity,status,round}:
+    review,2m0s,"$2",fixing,fix 2
+branch_sync:
+  state: pipeline_owned
+  changed: false
+EOF
+}
+
 pipeline_owned_sync() {
   cat <<'EOF'
 branch_sync:
@@ -1465,6 +1488,89 @@ test_pipeline_owned_status_custody_survives_failed_sync_probe() {
   pass "cached pipeline_owned custody holds when the fresh sync probe fails"
 }
 
+# `axi status` carries branch_sync only when the CLI considers it relevant, so
+# the second custody source has to actually work: a status answer with no
+# branch_sync block resolves custody from one bounded read-only `axi sync
+# --check`.
+test_pipeline_owned_status_without_branch_sync_uses_sync_check() {
+  reset_fakes
+  local d out
+  d=$(new_case pipeline-owned-probe-fallback)
+  make_repo_on_branch "$d/wt" fm/feat-custody-fallback
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/custody-fallback.meta" "window=fm:fm-custody-fallback" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'resolved: pipeline review resumed\n' > "$d/state/custody-fallback.status"
+  arm_idle_record "$d/state" custody-fallback
+  FM_FAKE_RUN_HEAD=8888888888888888888888888888888888888888
+  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active fm/feat-custody-fallback '3s ago: agent output')
+  FM_FAKE_AXI_SYNC=$(pipeline_owned_sync)
+  FM_FAKE_AXI_SYNC_CALLS="$d/sync-calls"
+  out=$(run_crew_state "$d" custody-fallback)
+  assert_contains "$out" "state: working" "sync --check custody -> working"
+  assert_contains "$out" "source: run-step" "sync --check custody -> run-step source"
+  [ -s "$FM_FAKE_AXI_SYNC_CALLS" ] \
+    || fail "a status answer without branch_sync must fall back to axi sync --check"
+  pass "custody falls back to axi sync --check when status omits branch_sync"
+}
+
+# The negative twin: with no branch_sync in status and a probe that cannot
+# answer (unreachable remote, or the CLI's unclean-worktree refusal), custody is
+# unproven and the run must not be attributed.
+test_no_branch_sync_and_failed_probe_is_not_current() {
+  reset_fakes
+  local d out
+  d=$(new_case pipeline-owned-no-custody-source)
+  make_repo_on_branch "$d/wt" fm/feat-custody-nosource
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/custody-nosource.meta" "window=fm:fm-custody-nosource" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'resolved: old pipeline decision closed\n' > "$d/state/custody-nosource.status"
+  arm_idle_record "$d/state" custody-nosource
+  FM_FAKE_RUN_HEAD=9999999999999999999999999999999999999999
+  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active fm/feat-custody-nosource '3s ago: agent output')
+  FM_FAKE_AXI_SYNC=""
+  FM_FAKE_AXI_SYNC_RC=1
+  out=$(run_crew_state "$d" custody-nosource)
+  assert_not_contains "$out" "source: run-step" "unproven custody must not use run-step"
+  assert_contains "$out" "state: unknown" "unproven custody falls through to current-state sources"
+  assert_contains "$out" "source: none" "an unanswerable custody probe is not custody"
+  pass "no branch_sync anywhere leaves the run unattributed"
+}
+
+test_pipeline_owned_reordered_columns_row_is_read_by_name() {
+  reset_fakes
+  local d out
+  d=$(new_case pipeline-owned-reordered)
+  make_repo_on_branch "$d/wt" fm/feat-custody-columns
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/custody-columns.meta" "window=fm:fm-custody-columns" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'resolved: pipeline review resumed\n' > "$d/state/custody-columns.status"
+  arm_idle_record "$d/state" custody-columns
+  FM_FAKE_RUN_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active_reordered_columns fm/feat-custody-columns '3s ago: ran tests, all green')
+  out=$(run_crew_state "$d" custody-columns)
+  assert_contains "$out" "state: working" "columns resolved from the table header -> working"
+  assert_contains "$out" "source: run-step" "columns resolved from the table header -> run-step source"
+  pass "active_steps columns are resolved by name, not by fixed position"
+}
+
+test_reordered_columns_quiet_row_is_not_current() {
+  reset_fakes
+  local d out
+  d=$(new_case pipeline-owned-reordered-quiet)
+  make_repo_on_branch "$d/wt" fm/feat-custody-columns-quiet
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/custody-columns-quiet.meta" "window=fm:fm-custody-columns-quiet" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'resolved: old pipeline decision closed\n' > "$d/state/custody-columns-quiet.status"
+  arm_idle_record "$d/state" custody-columns-quiet
+  FM_FAKE_RUN_HEAD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active_reordered_columns fm/feat-custody-columns-quiet 'quiet 12m0s ago: ran tests, all green')
+  out=$(run_crew_state "$d" custody-columns-quiet)
+  assert_not_contains "$out" "source: run-step" "a quiet row stays quiet under any column order"
+  assert_contains "$out" "state: unknown" "quiet reordered row falls through"
+  assert_contains "$out" "source: none" "quiet reordered row is not attributed"
+  pass "the quiet check survives column reordering and embedded commas"
+}
+
 test_pipeline_owned_quoted_active_row_is_current() {
   reset_fakes
   local d out
@@ -1613,6 +1719,10 @@ test_local_advanced_past_run_head_invalidates
 test_missing_run_head_falls_back_to_current_state
 test_pipeline_owned_recent_active_unknown_head_is_current
 test_pipeline_owned_status_custody_survives_failed_sync_probe
+test_pipeline_owned_status_without_branch_sync_uses_sync_check
+test_no_branch_sync_and_failed_probe_is_not_current
+test_pipeline_owned_reordered_columns_row_is_read_by_name
+test_reordered_columns_quiet_row_is_not_current
 test_pipeline_owned_quoted_active_row_is_current
 test_active_unknown_head_without_custody_is_not_current
 test_pipeline_owned_quiet_historical_run_is_not_current

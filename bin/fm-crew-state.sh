@@ -31,10 +31,13 @@
 #      One active-only exception covers the pipeline-owned window where its fix
 #      commits are not objects in the crew worktree: a same-branch run also
 #      matches when `active_steps` reports running/fixing with non-quiet recent
-#      activity and branch_sync reports pipeline_owned. That custody read comes
-#      from the branch_sync object `axi status` already returned, so the common
-#      case costs no extra process and no network; only a status answer that
-#      omits branch_sync falls back to a bounded read-only `axi sync --check`.
+#      activity and branch_sync reports pipeline_owned. Custody is read first
+#      from the branch_sync object `axi status` itself returns - free, and immune
+#      to a slow remote or a dirty worktree - and only a status answer that omits
+#      branch_sync entirely falls back to one bounded read-only `axi sync
+#      --check`. That fallback does read the remote and the CLI refuses it on an
+#      unclean worktree; when it cannot answer, custody is simply unproven and
+#      this exception does not fire, so the ordinary fall-through applies.
 #      Terminal, cancelled, parked, quiet, or activity-unknown runs still require
 #      the ordinary code-identity match.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
@@ -405,6 +408,14 @@ nm_coarse_head_matches_worktree() {  # <short-sha>
 # 120000`), so an unbounded scan would let a stale run whose only active_steps
 # row is quiet be attributed off the historical steps table when the CLI happens
 # to emit that table last.
+#
+# Columns are resolved BY NAME from the table's own `{...}` header rather than
+# by fixed position, the way the sibling row readers here avoid depending on
+# header text: the CLI documents agent_pid as present only while a subprocess
+# agent runs, so a column set that gains, loses, or reorders members must not
+# silently turn this predicate into a permanent "no active step". Rows are split
+# on unquoted commas only, because last_activity is a quoted free-text value
+# that can itself contain a comma.
 nm_run_has_recent_active_step() {
   local status outcome
   status=$(strip_quotes "$(nm_field status)")
@@ -416,9 +427,38 @@ nm_run_has_recent_active_step() {
       match(line, /^[[:space:]]*/)
       return RLENGTH
     }
-    /^[[:space:]]*active_steps\[[0-9]+\]\{step,status,active_for,last_activity,agent_pid,round\}:[[:space:]]*$/ {
-      in_active = 1
+    function clean(value) {
+      gsub(/"/, "", value)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+    function split_row(row, out,    i, ch, cur, n, quoted) {
+      n = 0
+      cur = ""
+      quoted = 0
+      for (i = 1; i <= length(row); i++) {
+        ch = substr(row, i, 1)
+        if (ch == "\"") { quoted = !quoted; cur = cur ch; continue }
+        if (ch == "," && !quoted) { out[++n] = cur; cur = ""; continue }
+        cur = cur ch
+      }
+      out[++n] = cur
+      return n
+    }
+    /^[[:space:]]*active_steps\[[0-9]+\]\{[^}]*\}:[[:space:]]*$/ {
       header_indent = indent_of($0)
+      columns = $0
+      sub(/^[^{]*\{/, "", columns)
+      sub(/\}:[[:space:]]*$/, "", columns)
+      column_count = split(columns, column, ",")
+      status_col = 0
+      activity_col = 0
+      for (i = 1; i <= column_count; i++) {
+        if (clean(column[i]) == "status") status_col = i
+        else if (clean(column[i]) == "last_activity") activity_col = i
+      }
+      in_active = (status_col > 0 && activity_col > 0)
       next
     }
     in_active {
@@ -429,14 +469,11 @@ nm_run_has_recent_active_step() {
       }
       row = $0
       sub(/^[[:space:]]+/, "", row)
-      count = split(row, field, ",")
-      step_status = field[2]
-      sub(/^[[:space:]\"]+/, "", step_status)
-      sub(/[[:space:]\"]+$/, "", step_status)
-      activity = field[4]
-      sub(/^[[:space:]\"]+/, "", activity)
-      sub(/[[:space:]\"]+$/, "", activity)
-      if (count >= 4 && (step_status == "running" || step_status == "fixing") &&
+      count = split_row(row, field)
+      if (count < status_col || count < activity_col) next
+      step_status = clean(field[status_col])
+      activity = clean(field[activity_col])
+      if ((step_status == "running" || step_status == "fixing") &&
           activity != "" && activity != "unknown" && activity !~ /^quiet([[:space:]]|$)/) {
         found = 1
         exit
@@ -480,14 +517,18 @@ nm_branch_sync_state() {  # <toon-output>
   strip_quotes "$raw"
 }
 
-# Branch custody for the active-run exception. `axi status` already returns the
-# structured branch_sync object whenever it is relevant, so prefer the answer
-# already in hand: it is free, and it cannot be lost to a slow or unreachable
-# remote or refused because the crew worktree is dirty - either of which would
-# reintroduce the very "unknown - none" misattribution this exception fixes.
-# Only a status answer that carries no branch_sync at all falls back to the
-# CLI's own bounded read-only custody read, `axi sync --check`. Custody holds
-# only while state is pipeline_owned; every blocked, terminal-recovery, and
+# Branch custody for the active-run exception. `axi status` returns the
+# structured branch_sync object when it is relevant (observed on a live
+# pipeline-owned run: state pipeline_owned with local branch/head/clean and the
+# owning pipeline run), so prefer the answer already in hand: it costs no extra
+# process, and it cannot be lost to a slow or unreachable remote or refused
+# because the crew worktree is dirty.
+#
+# A status answer that carries no branch_sync at all falls back to one bounded
+# read-only `axi sync --check`. That fallback DOES read the remote, so it is
+# deliberately second: it can time out or be refused on an unclean worktree, and
+# then custody is unproven and the exception does not fire. Custody holds only
+# while state is pipeline_owned; every blocked, terminal-recovery, and
 # user-owned state is a rejection here.
 nm_pipeline_owns_branch() {
   local sync_state
