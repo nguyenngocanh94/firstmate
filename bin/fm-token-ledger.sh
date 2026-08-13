@@ -475,11 +475,16 @@ EOF
   trap 'rm -f "$firstlines_tmp"; exit 130' INT
   trap 'rm -f "$firstlines_tmp"; exit 143' TERM
   # shellcheck disable=SC2016 # single-quoted intentionally: FILENAME and $0 are awk's own variables, not the shell's
-  # -type f matches the [ -f "$f" ] guard on the claude, pi and grok paths: this
-  # scan opens every candidate, so without it a FIFO or device node named
+  # -L -type f matches the [ -f "$f" ] guard on the claude, pi and grok paths:
+  # this scan opens every candidate, so without it a FIFO or device node named
   # *.jsonl inside a day-partition would be opened and read by production, and a
-  # FIFO would block until something wrote to it.
-  find "${day_arr[@]}" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null \
+  # FIFO would block until something wrote to it. -L is what makes the parity
+  # exact rather than approximate - `test -f` follows symlinks while a bare
+  # `find -type f` lstats, so without it a rollout symlinked in from archived
+  # history (a regular file behind the link) would silently stop resolving. With
+  # -L a symlink to a regular file is -type f and a symlink to a FIFO is -type p,
+  # and -maxdepth 1 over explicit day directories leaves no traversal to loop on.
+  find -L "${day_arr[@]}" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null \
     | xargs -0 awk 'FNR==1{print FILENAME "\t" $0; nextfile}' > "$firstlines_tmp" 2>/dev/null
   # Raw (-r) text of the exact JSON-escaped fragment: a plain substring match
   # against compact JSON, not a parse, is what keeps this a single grep pass.

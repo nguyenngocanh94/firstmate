@@ -568,6 +568,35 @@ CODEXJ3=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_ROOT" FM_COD
   || fail "codex --task resolution: the stale rollout must contribute an observable call once inside the window, got $(printf '%s' "$CODEXJ3" | jq 'length')"
 pass "codex --task resolution finds the exact cwd match, and the day-partition bound is what excludes the equally-matching 2020 rollout"
 
+# The codex scan filters candidates to regular files so it can never open - and
+# on a FIFO, block forever on - a non-regular file that happens to be named
+# *.jsonl. That filter must mean exactly what `[ -f "$f" ]` means on the
+# claude/pi/grok paths: a symlink to a regular rollout IS a readable rollout
+# (archived history linked back into a day-partition), while a FIFO is not.
+# `find -type f` alone lstats and would silently drop the symlink, losing real
+# measurement input; both halves are asserted here against one day-partition
+# holding one of each.
+CODEX_LINK_ROOT="$TMP_ROOT/codex-link"
+CODEX_LINK_WT="/fixture/codex-link-wt"
+mkdir -p "$CODEX_LINK_ROOT/2026/08/12" "$CODEX_LINK_ROOT/archive"
+jq -cn --arg cwd "$CODEX_LINK_WT" '{type:"session_meta", timestamp:"2026-08-12T06:00:00.000Z",
+  payload:{id:"codexsess-linked", cwd:$cwd}}' > "$CODEX_LINK_ROOT/archive/real.jsonl"
+jq -cn '{payload:{type:"token_count", info:{last_token_usage:{input_tokens:70, cached_input_tokens:0,
+  cache_write_input_tokens:0, output_tokens:7, reasoning_output_tokens:0, total_tokens:77},
+  total_token_usage:{total_tokens:77}}}}' >> "$CODEX_LINK_ROOT/archive/real.jsonl"
+ln -s "$CODEX_LINK_ROOT/archive/real.jsonl" "$CODEX_LINK_ROOT/2026/08/12/rollout-linked.jsonl"
+if mkfifo "$CODEX_LINK_ROOT/2026/08/12/rollout-wedged.jsonl" 2>/dev/null; then
+  write_task_meta "$TASK_STATE" codex-link codex "$CODEX_LINK_WT"
+  CODEX_LINKJ=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_LINK_ROOT" \
+    "$LEDGER" --task codex-link --json 2>/dev/null)
+  [ "$(printf '%s' "$CODEX_LINKJ" | jq -r '[.[].session_id] | unique | join(",")')" = codexsess-linked ] \
+    || fail "codex --task resolution: a symlinked rollout must resolve exactly like a plain one, and a FIFO beside it must be skipped rather than opened, got: $CODEX_LINKJ"
+  rm -f "$CODEX_LINK_ROOT/2026/08/12/rollout-wedged.jsonl"
+  pass "the codex scan reads a symlinked rollout and refuses a FIFO, matching [ -f ] on the other runtimes"
+else
+  echo "skip: mkfifo unavailable, so the codex scan's non-regular-file exclusion cannot be exercised here"
+fi
+
 # Any window below one day scans nothing at all. That is a caller configuration
 # error, so it must name itself as one - not leak a raw `head: illegal line
 # count -- 0` from the shell, and not claim the partitions are missing when

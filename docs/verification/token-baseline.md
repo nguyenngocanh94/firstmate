@@ -245,12 +245,19 @@ It first used a FIFO on the claude path, where `[ -f "$f" ]` is false for a FIFO
 It then moved the FIFO to a codex day-partition, which did block, because that scan piped `find -name '*.jsonl'` straight into `awk` with no `-type f` and so opened whatever the glob matched.
 That worked only because the codex path lacked the regular-file guard the other three runtimes have, which is a real inconsistency rather than a useful property: a FIFO or device node named `*.jsonl` under `~/.codex/sessions/YYYY/MM/DD/` would have been opened and read by production.
 The guard is now present on all four paths, and the hang case no longer depends on its absence.
+It is `find -L ... -type f` rather than a bare `-type f`, because `test -f` follows symlinks while `find -type f` lstats: without `-L` a rollout symlinked in from archived history would have silently stopped resolving, which is a narrowing rather than a hardening.
+With `-L` a symlink to a regular file is `-type f` and a symlink to a FIFO is `-type p`, so the codex filter now matches `[ -f "$f" ]` exactly.
 
 The case instead uses a regular file the guards accept but that is slow to read.
-`awk 'FNR==1{...}'` must read a rollout's entire first line before it can decide anything, so a 200MB first line keeps the scan busy for roughly 5 seconds against the case's 1-second bound.
-Measured on the development host, twice: exit 124 with the fixture costing about 0.4 seconds to generate and 191MB of temporary disk, which the case removes as soon as teardown returns.
-The margin is roughly 5x, so the read would have to get about five times faster before the case stopped crossing the bound.
-That is a timing-based rather than an absolute block, and the assertion is written to say so: if the timeout note ever goes missing the failure message states that the fixture stopped outrunning the timeout and must grow, rather than implying the bound is fine.
+`awk 'FNR==1{...}'` must read a rollout's entire first line before it can decide anything, so a 200MB first line keeps the scan busy for several seconds against the case's 1-second bound.
+Measured on the development host (macOS, `awk version 20200816`, the slowest awk this repo runs on): the awk pass alone takes 2.89s and the full `fm-token-ledger.sh --task` resolve takes 4.33s, i.e. a margin of roughly 4x over the bound.
+Generating the fixture with the pipeline the case actually uses costs 7.76s and 7.81s wall across two runs plus 191MB of temporary disk, which the case removes as soon as teardown returns.
+That cost is CPU-bound in BSD `tr`, so it does not vary with cache state - an earlier revision of this paragraph reported 0.4s, which came from a `python3` generator rather than the `head -c … | tr` pipeline in the test, and did not reproduce.
+
+The margin depends entirely on which `awk` the host ships, so this is a throughput race rather than an absolute block, and the case is written to say so rather than to bet on it.
+CI runs this suite on `ubuntu-latest`, whose default `mawk` is materially faster on a single-record scan of this shape and may well finish inside the bound.
+When the timeout note is absent the case therefore SKIPS with a message naming the measured elapsed time, the 1-second bound, and the fact that the timeout ladder was not exercised on that host - it never asserts a timeout it did not observe, and never fails the host for being fast.
+The fixture is deliberately held at 200MB: growing it only moves the threshold of the same race while charging every run more disk and setup time.
 It gains two further cases covering how the hook classifies a report it did produce.
 The hook captures only the reporter's stdout - the report path, and nothing else - and leaves its stderr attached, so every relayed diagnostic reaches the raw log exactly once and the captain-facing note is decided from the reporter's exit status and that path alone, never from diagnostic text.
 One case proves a successful report whose ledger emitted the routine `duplicate_usage_records` count still writes its JSON, shows that count on stderr, and earns no note; the other proves a dropped log line reaches stderr the same way without turning a produced report into a skip.
