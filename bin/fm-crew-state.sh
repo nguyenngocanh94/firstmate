@@ -9,8 +9,8 @@
 # re-validates), the log's last line stays stale. This helper never infers the
 # current state from a tail of the log: it reads the authoritative source (a
 # no-mistakes run-step attributed to this crew's branch and current code
-# identity (or to a recently-active run while the pipeline owns the branch),
-# else the pane busy-signature) and reconciles the possibly-stale log against it.
+# identity (or to a same-branch run whose active step is currently live), else
+# the pane busy-signature) and reconciles the possibly-stale log against it.
 #
 # The determinism lives entirely here - only run-step / pane / log reads plus
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
@@ -28,18 +28,16 @@
 #      is an ancestor of the run head (pipeline fix commits advanced the run on
 #      the same line of history). Local work that advanced past the run head, or
 #      diverged from it, invalidates attribution.
-#      One active-only exception covers the pipeline-owned window where its fix
-#      commits are not objects in the crew worktree: a same-branch run also
-#      matches when `active_steps` reports running/fixing with non-quiet recent
-#      activity and branch_sync reports pipeline_owned. Custody is read first
-#      from the branch_sync object `axi status` itself returns - free, and immune
-#      to a slow remote or a dirty worktree - and only a status answer that omits
-#      branch_sync entirely falls back to one bounded read-only `axi sync
-#      --check`. That fallback does read the remote and the CLI refuses it on an
-#      unclean worktree; when it cannot answer, custody is simply unproven and
-#      this exception does not fire, so the ordinary fall-through applies.
-#      Terminal, cancelled, parked, quiet, or activity-unknown runs still require
-#      the ordinary code-identity match.
+#      One active-only exception covers the pipeline-owned window where the
+#      pipeline's own fix commits are not objects in the crew worktree, so no
+#      code-identity match is possible at all: a same-branch run also matches
+#      when `active_steps` reports a running/fixing step whose last_activity is
+#      neither quiet nor unknown. That local active-and-recent signal alone is
+#      sufficient - no branch-custody proof is required, and this path adds no
+#      network read to the heartbeat. Terminal, cancelled, parked, quiet, and
+#      activity-unknown runs still require the ordinary code-identity match, so
+#      a stale historical run on a reused branch is never attributed on a
+#      branch-name match alone.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -393,6 +391,11 @@ nm_coarse_head_matches_worktree() {  # <short-sha>
   fm_nm_head_matches_worktree "$WT" "$1"
 }
 
+# The whole active-only attribution exception: 0 when this same-branch run has a
+# live step right now, which is the sole positive signal when the run head is not
+# an object in the crew worktree. It reads only the `axi status` answer already
+# captured above, so it stays free and network-free.
+#
 # `axi status` exposes active execution in a dedicated table with columns
 # step,status,active_for,last_activity,agent_pid,round. The CLI prefixes
 # last_activity with "quiet" after its configured step_quiet_warning and emits
@@ -483,62 +486,6 @@ nm_run_has_recent_active_step() {
   '
 }
 
-# branch_sync.state out of one captured TOON answer ($1), bounded to the
-# branch_sync block: only a `state:` key at the block's own direct-child indent
-# counts, so a nested sub-object's `state:` (e.g. under next_action) and any
-# later sibling block's `state:` are never mistaken for custody.
-nm_branch_sync_state() {  # <toon-output>
-  local raw
-  raw=$(printf '%s\n' "$1" | awk '
-    function indent_of(line) {
-      match(line, /^[[:space:]]*/)
-      return RLENGTH
-    }
-    /^[[:space:]]*branch_sync:[[:space:]]*$/ {
-      in_sync = 1
-      header_indent = indent_of($0)
-      child_indent = -1
-      next
-    }
-    in_sync {
-      if ($0 ~ /^[[:space:]]*$/ || indent_of($0) <= header_indent) {
-        in_sync = 0
-        next
-      }
-      if (child_indent < 0) child_indent = indent_of($0)
-      if (indent_of($0) == child_indent && $0 ~ /^[[:space:]]*state:([[:space:]]|$)/) {
-        value = $0
-        sub(/^[[:space:]]*state:[[:space:]]*/, "", value)
-        print value
-        exit
-      }
-    }
-  ')
-  strip_quotes "$raw"
-}
-
-# Branch custody for the active-run exception. `axi status` returns the
-# structured branch_sync object when it is relevant (observed on a live
-# pipeline-owned run: state pipeline_owned with local branch/head/clean and the
-# owning pipeline run), so prefer the answer already in hand: it costs no extra
-# process, and it cannot be lost to a slow or unreachable remote or refused
-# because the crew worktree is dirty.
-#
-# A status answer that carries no branch_sync at all falls back to one bounded
-# read-only `axi sync --check`. That fallback DOES read the remote, so it is
-# deliberately second: it can time out or be refused on an unclean worktree, and
-# then custody is unproven and the exception does not fire. Custody holds only
-# while state is pipeline_owned; every blocked, terminal-recovery, and
-# user-owned state is a rejection here.
-nm_pipeline_owns_branch() {
-  local sync_state
-  sync_state=$(nm_branch_sync_state "$RUN_OUT")
-  if [ -z "$sync_state" ]; then
-    sync_state=$(nm_branch_sync_state "$(nm_run axi sync --check)")
-  fi
-  [ "$sync_state" = pipeline_owned ]
-}
-
 HAVE_RUN=0
 # RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
 # $RUN_OUT is real `axi status` TOON with step/gate detail; "coarse" means only
@@ -553,8 +500,7 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
     if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
-      if nm_run_head_matches_worktree \
-        || { nm_run_has_recent_active_step && nm_pipeline_owns_branch; }; then
+      if nm_run_head_matches_worktree || nm_run_has_recent_active_step; then
         HAVE_RUN=1
       fi
     fi

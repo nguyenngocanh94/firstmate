@@ -70,12 +70,6 @@ case "${1:-}" in
         shift
         if [ "${1:-}" = --run ]; then printf '%s\n' "${FM_FAKE_AXI_STATUS_RUN:-}"
         else printf '%s\n' "${FM_FAKE_AXI_STATUS:-}"; fi ;;
-      sync)
-        shift
-        [ "${1:-}" = --check ] || exit 64
-        [ -n "${FM_FAKE_AXI_SYNC_CALLS:-}" ] && printf 'sync --check\n' >> "$FM_FAKE_AXI_SYNC_CALLS"
-        printf '%s\n' "${FM_FAKE_AXI_SYNC:-}"
-        exit "${FM_FAKE_AXI_SYNC_RC:-0}" ;;
       logs)
         printf '%s\n' "${FM_FAKE_CI_LOGS:-}" ;;
     esac
@@ -176,12 +170,8 @@ reset_fakes() {
   FM_FAKE_HERDR_MISSING=0
   FM_FAKE_HERDR_AGENT_STATUS=""
   FM_FAKE_CI_LOGS=""
-  FM_FAKE_AXI_SYNC=""
-  FM_FAKE_AXI_SYNC_RC=0
-  FM_FAKE_AXI_SYNC_CALLS=""
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_BUSY_TEXT FM_FAKE_TMUX_MISSING
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
-  export FM_FAKE_AXI_SYNC FM_FAKE_AXI_SYNC_RC FM_FAKE_AXI_SYNC_CALLS
 }
 
 # --- run-object fixtures (TOON, as `no-mistakes axi status` emits) -----------
@@ -352,10 +342,11 @@ run:
 EOF
 }
 
-# An active pipeline fix round. $3, when given, embeds the branch_sync object
-# `axi status` itself returns; omitting it models a status answer that carries no
-# branch_sync, which is the only case allowed to fall back to `axi sync --check`.
-run_pipeline_owned_active() {  # <branch> <last-activity> [branch-sync-state]
+# An active pipeline fix round, as `axi status` emits it while the pipeline is
+# working on the crew's branch: an `active_steps` table carrying the CLI's own
+# freshness verdict in last_activity ("quiet ..." past its quiet warning,
+# "unknown" with no activity timestamp at all).
+run_active_fix_round() {  # <branch> <last-activity>
   cat <<EOF
 run:
   id: "01RUN"
@@ -369,104 +360,6 @@ run:
     review,fixing,0,120000
   active_steps[1]{step,status,active_for,last_activity,agent_pid,round}:
     review,fixing,2m0s,"$2",12345,fix 2
-EOF
-  if [ -n "${3:-}" ]; then
-    cat <<EOF
-branch_sync:
-  state: $3
-  changed: false
-  next_action:
-    code: none
-    state: not_required
-EOF
-  fi
-}
-
-# The same active run with the historical steps[] table emitted AFTER
-# active_steps. Row order between the two tables is not a contract, and a
-# steps[] row such as `review,fixing,0,120000` has exactly the shape an
-# active_steps row check accepts, so this pins that the active_steps scan stays
-# inside its own block instead of reading liveness out of run history.
-run_pipeline_owned_active_steps_table_last() {  # <branch> <last-activity>
-  cat <<EOF
-run:
-  id: "01RUN"
-  branch: $1
-  status: fixing
-  head: "${FM_FAKE_RUN_HEAD:-abc1234}"
-  pr: ""
-  findings: none
-  active_steps[1]{step,status,active_for,last_activity,agent_pid,round}:
-    review,fixing,2m0s,"$2",12345,fix 2
-  steps[2]{step,status,findings,duration_ms}:
-    intent,completed,0,0
-    review,fixing,0,120000
-branch_sync:
-  state: pipeline_owned
-  changed: false
-EOF
-}
-
-# TOON quotes and pads values where it needs to, and the sibling gate-row read in
-# fm-crew-state.sh already tolerates an optionally quoted, space-padded status
-# column. This pins the active-step read to the same tolerance, so a quoted
-# column cannot silently turn the custody exception into a no-op.
-run_pipeline_owned_active_quoted_columns() {  # <branch> <last-activity>
-  cat <<EOF
-run:
-  id: "01RUN"
-  branch: $1
-  status: fixing
-  head: "${FM_FAKE_RUN_HEAD:-abc1234}"
-  pr: ""
-  findings: none
-  active_steps[1]{step,status,active_for,last_activity,agent_pid,round}:
-    "review", "fixing", "2m0s", "$2", 12345, "fix 2"
-branch_sync:
-  state: pipeline_owned
-  changed: false
-EOF
-}
-
-# A TOON table declares its own columns in the `{...}` header, and a quoted
-# value may contain the comma delimiter. This fixture exercises both at once:
-# `status` sits after `last_activity`, and `last_activity` carries an embedded
-# comma, so any reader that assumes fixed column positions or splits on every
-# comma reads the wrong column. The CLI documents `agent_pid` as present only
-# while a subprocess agent runs, so the column set is not a fixed shape.
-run_pipeline_owned_active_reordered_columns() {  # <branch> <last-activity>
-  cat <<EOF
-run:
-  id: "01RUN"
-  branch: $1
-  status: fixing
-  head: "${FM_FAKE_RUN_HEAD:-abc1234}"
-  pr: ""
-  findings: none
-  active_steps[1]{step,active_for,last_activity,status,round}:
-    review,2m0s,"$2",fixing,fix 2
-branch_sync:
-  state: pipeline_owned
-  changed: false
-EOF
-}
-
-pipeline_owned_sync() {
-  cat <<'EOF'
-branch_sync:
-  state: pipeline_owned
-  changed: false
-  safety: blocked_pipeline_owned
-EOF
-}
-
-user_owned_sync() {
-  cat <<'EOF'
-branch_sync:
-  state: user_owned
-  changed: false
-  next_action:
-    code: none
 EOF
 }
 
@@ -1437,258 +1330,67 @@ test_missing_run_head_falls_back_to_current_state() {
   pass "missing run head falls back instead of matching by branch"
 }
 
-# Pipeline custody is the narrow exception to local object identity. During a
-# fix round the pipeline head exists only in its isolated copy, so the crew's
-# worktree cannot resolve it. The active_steps table supplies both the active
-# status and the CLI's freshness verdict; branch_sync supplies custody.
-test_pipeline_owned_recent_active_unknown_head_is_current() {
+# The active-only attribution exception. During a pipeline fix round the run
+# head exists only in the pipeline's isolated copy, so the crew worktree cannot
+# resolve it as an object and code identity can never match. An active step with
+# the CLI's own non-quiet freshness verdict, on a run for this crew's branch, is
+# by itself enough to attribute the run - no branch-custody proof, and no extra
+# CLI call beyond the `axi status` answer already read.
+test_active_recent_run_with_unknown_head_is_current() {
   reset_fakes
   local d out unknown_head
-  d=$(new_case pipeline-owned-active)
-  make_repo_on_branch "$d/wt" fm/feat-custody
+  d=$(new_case active-unknown-head)
+  make_repo_on_branch "$d/wt" fm/feat-active
   make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody.meta" "window=fm:fm-custody" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: pipeline review resumed\n' > "$d/state/custody.status"
-  arm_idle_record "$d/state" custody
+  fm_write_meta "$d/state/active.meta" "window=fm:fm-active" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'resolved: pipeline review resumed\n' > "$d/state/active.status"
+  arm_idle_record "$d/state" active
   unknown_head=1111111111111111111111111111111111111111
   git -C "$d/wt" cat-file -e "${unknown_head}^{commit}" 2>/dev/null \
-    && fail "pipeline-owned fixture head unexpectedly exists in the crew worktree"
+    && fail "fixture run head unexpectedly exists in the crew worktree"
   FM_FAKE_RUN_HEAD=$unknown_head
-  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active fm/feat-custody '3s ago: agent output' pipeline_owned)
-  FM_FAKE_AXI_SYNC_CALLS="$d/sync-calls"
-  out=$(run_crew_state "$d" custody)
-  assert_contains "$out" "state: working" "pipeline-owned active run -> working"
-  assert_contains "$out" "source: run-step" "pipeline-owned active run -> run-step source"
-  assert_contains "$out" "validating (fixing)" "pipeline-owned active run reports its step"
-  [ -e "$FM_FAKE_AXI_SYNC_CALLS" ] \
-    && fail "custody read must reuse axi status' branch_sync, not spawn axi sync --check"
-  pass "pipeline-owned recent active run does not require a local run-head object"
+  FM_FAKE_AXI_STATUS=$(run_active_fix_round fm/feat-active '3s ago: agent output')
+  out=$(run_crew_state "$d" active)
+  assert_contains "$out" "state: working" "recent active step -> working"
+  assert_contains "$out" "source: run-step" "recent active step -> run-step source"
+  assert_contains "$out" "validating (fixing)" "attributed run reports its step"
+  pass "active, recently-live run is attributed without a local run-head object"
 }
 
-# The heartbeat path must not depend on `axi sync --check` succeeding: that call
-# reads the live remote and refuses on a dirty worktree, so a slow, unreachable,
-# or refusing probe would otherwise reinstate the exact `unknown - none`
-# misattribution the custody exception exists to fix.
-test_pipeline_owned_status_custody_survives_failed_sync_probe() {
+# The anti-misattribution twin: branches are reused across runs, so a run with
+# no live step - terminal, or active but past the CLI's own quiet warning - must
+# still require the ordinary code-identity match rather than riding on the
+# branch name.
+test_terminal_or_stale_run_with_unknown_head_is_not_current() {
   reset_fakes
-  local d out
-  d=$(new_case pipeline-owned-probe-fails)
-  make_repo_on_branch "$d/wt" fm/feat-custody-probe
+  local d out dt outt
+  d=$(new_case stale-unknown-head)
+  make_repo_on_branch "$d/wt" fm/feat-stale
   make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody-probe.meta" "window=fm:fm-custody-probe" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: pipeline review resumed\n' > "$d/state/custody-probe.status"
-  arm_idle_record "$d/state" custody-probe
-  FM_FAKE_RUN_HEAD=4444444444444444444444444444444444444444
-  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active fm/feat-custody-probe '3s ago: agent output' pipeline_owned)
-  FM_FAKE_AXI_SYNC=""
-  FM_FAKE_AXI_SYNC_RC=1
-  out=$(run_crew_state "$d" custody-probe)
-  assert_contains "$out" "state: working" "status branch_sync custody -> working without a live probe"
-  assert_contains "$out" "source: run-step" "status branch_sync custody -> run-step source"
-  pass "cached pipeline_owned custody holds when the fresh sync probe fails"
-}
-
-# `axi status` carries branch_sync only when the CLI considers it relevant, so
-# the second custody source has to actually work: a status answer with no
-# branch_sync block resolves custody from one bounded read-only `axi sync
-# --check`.
-test_pipeline_owned_status_without_branch_sync_uses_sync_check() {
-  reset_fakes
-  local d out
-  d=$(new_case pipeline-owned-probe-fallback)
-  make_repo_on_branch "$d/wt" fm/feat-custody-fallback
-  make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody-fallback.meta" "window=fm:fm-custody-fallback" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: pipeline review resumed\n' > "$d/state/custody-fallback.status"
-  arm_idle_record "$d/state" custody-fallback
-  FM_FAKE_RUN_HEAD=8888888888888888888888888888888888888888
-  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active fm/feat-custody-fallback '3s ago: agent output')
-  FM_FAKE_AXI_SYNC=$(pipeline_owned_sync)
-  FM_FAKE_AXI_SYNC_CALLS="$d/sync-calls"
-  out=$(run_crew_state "$d" custody-fallback)
-  assert_contains "$out" "state: working" "sync --check custody -> working"
-  assert_contains "$out" "source: run-step" "sync --check custody -> run-step source"
-  [ -s "$FM_FAKE_AXI_SYNC_CALLS" ] \
-    || fail "a status answer without branch_sync must fall back to axi sync --check"
-  pass "custody falls back to axi sync --check when status omits branch_sync"
-}
-
-# The negative twin: with no branch_sync in status and a probe that cannot
-# answer (unreachable remote, or the CLI's unclean-worktree refusal), custody is
-# unproven and the run must not be attributed.
-test_no_branch_sync_and_failed_probe_is_not_current() {
-  reset_fakes
-  local d out
-  d=$(new_case pipeline-owned-no-custody-source)
-  make_repo_on_branch "$d/wt" fm/feat-custody-nosource
-  make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody-nosource.meta" "window=fm:fm-custody-nosource" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: old pipeline decision closed\n' > "$d/state/custody-nosource.status"
-  arm_idle_record "$d/state" custody-nosource
-  FM_FAKE_RUN_HEAD=9999999999999999999999999999999999999999
-  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active fm/feat-custody-nosource '3s ago: agent output')
-  FM_FAKE_AXI_SYNC=""
-  FM_FAKE_AXI_SYNC_RC=1
-  out=$(run_crew_state "$d" custody-nosource)
-  assert_not_contains "$out" "source: run-step" "unproven custody must not use run-step"
-  assert_contains "$out" "state: unknown" "unproven custody falls through to current-state sources"
-  assert_contains "$out" "source: none" "an unanswerable custody probe is not custody"
-  pass "no branch_sync anywhere leaves the run unattributed"
-}
-
-test_pipeline_owned_reordered_columns_row_is_read_by_name() {
-  reset_fakes
-  local d out
-  d=$(new_case pipeline-owned-reordered)
-  make_repo_on_branch "$d/wt" fm/feat-custody-columns
-  make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody-columns.meta" "window=fm:fm-custody-columns" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: pipeline review resumed\n' > "$d/state/custody-columns.status"
-  arm_idle_record "$d/state" custody-columns
-  FM_FAKE_RUN_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active_reordered_columns fm/feat-custody-columns '3s ago: ran tests, all green')
-  out=$(run_crew_state "$d" custody-columns)
-  assert_contains "$out" "state: working" "columns resolved from the table header -> working"
-  assert_contains "$out" "source: run-step" "columns resolved from the table header -> run-step source"
-  pass "active_steps columns are resolved by name, not by fixed position"
-}
-
-test_reordered_columns_quiet_row_is_not_current() {
-  reset_fakes
-  local d out
-  d=$(new_case pipeline-owned-reordered-quiet)
-  make_repo_on_branch "$d/wt" fm/feat-custody-columns-quiet
-  make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody-columns-quiet.meta" "window=fm:fm-custody-columns-quiet" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: old pipeline decision closed\n' > "$d/state/custody-columns-quiet.status"
-  arm_idle_record "$d/state" custody-columns-quiet
-  FM_FAKE_RUN_HEAD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active_reordered_columns fm/feat-custody-columns-quiet 'quiet 12m0s ago: ran tests, all green')
-  out=$(run_crew_state "$d" custody-columns-quiet)
-  assert_not_contains "$out" "source: run-step" "a quiet row stays quiet under any column order"
-  assert_contains "$out" "state: unknown" "quiet reordered row falls through"
-  assert_contains "$out" "source: none" "quiet reordered row is not attributed"
-  pass "the quiet check survives column reordering and embedded commas"
-}
-
-test_pipeline_owned_quoted_active_row_is_current() {
-  reset_fakes
-  local d out
-  d=$(new_case pipeline-owned-quoted)
-  make_repo_on_branch "$d/wt" fm/feat-custody-quoted
-  make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody-quoted.meta" "window=fm:fm-custody-quoted" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: pipeline review resumed\n' > "$d/state/custody-quoted.status"
-  arm_idle_record "$d/state" custody-quoted
-  FM_FAKE_RUN_HEAD=7777777777777777777777777777777777777777
-  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active_quoted_columns fm/feat-custody-quoted '3s ago: agent output')
-  out=$(run_crew_state "$d" custody-quoted)
-  assert_contains "$out" "state: working" "quoted active_steps columns still read as an active step"
-  assert_contains "$out" "source: run-step" "quoted active_steps columns -> run-step source"
-  pass "a quoted, padded active_steps row is read like a bare one"
-}
-
-# Custody is half of the conjunction: an active, recently-live, unknown-head run
-# whose branch is back under the user must NOT be attributed.
-test_active_unknown_head_without_custody_is_not_current() {
-  reset_fakes
-  local d out
-  d=$(new_case pipeline-owned-user-owned)
-  make_repo_on_branch "$d/wt" fm/feat-custody-user
-  make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody-user.meta" "window=fm:fm-custody-user" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: old pipeline decision closed\n' > "$d/state/custody-user.status"
-  arm_idle_record "$d/state" custody-user
-  FM_FAKE_RUN_HEAD=5555555555555555555555555555555555555555
-  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active fm/feat-custody-user '3s ago: agent output' user_owned)
-  FM_FAKE_AXI_SYNC=$(user_owned_sync)
-  out=$(run_crew_state "$d" custody-user)
-  assert_not_contains "$out" "source: run-step" "user_owned branch must not use run-step"
-  assert_contains "$out" "state: unknown" "user_owned branch falls through to current-state sources"
-  assert_contains "$out" "source: none" "an active unknown-head run alone is not attribution"
-  pass "active unknown-head run without pipeline custody is not attributed"
-}
-
-# The liveness read must come from the active_steps block itself, not from a
-# historical steps[] row that happens to sit after it.
-test_pipeline_owned_quiet_run_with_trailing_steps_table_is_not_current() {
-  reset_fakes
-  local d out
-  d=$(new_case pipeline-owned-quiet-steps-last)
-  make_repo_on_branch "$d/wt" fm/feat-custody-order
-  make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody-order.meta" "window=fm:fm-custody-order" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: old pipeline decision closed\n' > "$d/state/custody-order.status"
-  arm_idle_record "$d/state" custody-order
-  FM_FAKE_RUN_HEAD=6666666666666666666666666666666666666666
-  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active_steps_table_last fm/feat-custody-order 'quiet 12m0s ago: step log updated')
-  FM_FAKE_AXI_SYNC=$(pipeline_owned_sync)
-  out=$(run_crew_state "$d" custody-order)
-  assert_not_contains "$out" "source: run-step" "a quiet active step must not be rescued by a later steps[] row"
-  assert_contains "$out" "state: unknown" "quiet run with a trailing steps table falls through"
-  assert_contains "$out" "source: none" "run history is not a liveness signal"
-  pass "quiet active step is not attributed from a later steps[] table"
-}
-
-test_pipeline_owned_quiet_historical_run_is_not_current() {
-  reset_fakes
-  local d out
-  d=$(new_case pipeline-owned-quiet)
-  make_repo_on_branch "$d/wt" fm/feat-custody-quiet
-  make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody-quiet.meta" "window=fm:fm-custody-quiet" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: old pipeline decision closed\n' > "$d/state/custody-quiet.status"
-  arm_idle_record "$d/state" custody-quiet
+  fm_write_meta "$d/state/stale.meta" "window=fm:fm-stale" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'resolved: old pipeline decision closed\n' > "$d/state/stale.status"
+  arm_idle_record "$d/state" stale
   FM_FAKE_RUN_HEAD=2222222222222222222222222222222222222222
-  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active fm/feat-custody-quiet 'quiet 12m0s ago: step log updated')
-  FM_FAKE_AXI_SYNC=$(pipeline_owned_sync)
-  out=$(run_crew_state "$d" custody-quiet)
-  assert_not_contains "$out" "source: run-step" "quiet historical run must not use run-step"
-  assert_contains "$out" "state: unknown" "quiet historical run falls through to current-state sources"
-  assert_contains "$out" "source: none" "quiet historical run is not attributed by branch custody alone"
-  pass "pipeline-owned quiet historical run is not attributed"
-}
+  FM_FAKE_AXI_STATUS=$(run_active_fix_round fm/feat-stale 'quiet 12m0s ago: step log updated')
+  out=$(run_crew_state "$d" stale)
+  assert_not_contains "$out" "source: run-step" "a quiet step is not a liveness signal"
+  assert_contains "$out" "state: unknown" "stale run falls through to current-state sources"
+  assert_contains "$out" "source: none" "stale run is not attributed by branch name alone"
 
-# The CLI emits `unknown` for last_activity when no activity timestamp exists at
-# all, which is the absence of a liveness signal rather than a fresh one. Without
-# proof of recent activity the exception must not fire, so this run falls through
-# exactly like a quiet one.
-test_pipeline_owned_unknown_activity_is_not_current() {
   reset_fakes
-  local d out
-  d=$(new_case pipeline-owned-activity-unknown)
-  make_repo_on_branch "$d/wt" fm/feat-custody-activity-unknown
-  make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody-activity-unknown.meta" "window=fm:fm-custody-activity-unknown" \
-    "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: old pipeline decision closed\n' > "$d/state/custody-activity-unknown.status"
-  arm_idle_record "$d/state" custody-activity-unknown
-  FM_FAKE_RUN_HEAD=cccccccccccccccccccccccccccccccccccccccc
-  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active fm/feat-custody-activity-unknown unknown pipeline_owned)
-  out=$(run_crew_state "$d" custody-activity-unknown)
-  assert_not_contains "$out" "source: run-step" "activity-unknown run must not use run-step"
-  assert_contains "$out" "state: unknown" "activity-unknown run falls through to current-state sources"
-  assert_contains "$out" "source: none" "an absent activity timestamp is not recent activity"
-  pass "pipeline-owned run with unknown last_activity is not attributed"
-}
-
-test_pipeline_owned_terminal_unknown_head_is_not_current() {
-  reset_fakes
-  local d out
-  d=$(new_case pipeline-owned-terminal)
-  make_repo_on_branch "$d/wt" fm/feat-custody-terminal
-  make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/custody-terminal.meta" "window=fm:fm-custody-terminal" "worktree=$d/wt" "kind=ship" "harness=claude"
-  printf 'resolved: old pipeline decision closed\n' > "$d/state/custody-terminal.status"
-  arm_idle_record "$d/state" custody-terminal
+  dt=$(new_case terminal-unknown-head)
+  make_repo_on_branch "$dt/wt" fm/feat-terminal
+  make_fakebin "$dt" >/dev/null
+  fm_write_meta "$dt/state/terminal.meta" "window=fm:fm-terminal" "worktree=$dt/wt" "kind=ship" "harness=claude"
+  printf 'resolved: old pipeline decision closed\n' > "$dt/state/terminal.status"
+  arm_idle_record "$dt/state" terminal
   FM_FAKE_RUN_HEAD=3333333333333333333333333333333333333333
-  FM_FAKE_AXI_STATUS=$(run_passed fm/feat-custody-terminal)
-  FM_FAKE_AXI_SYNC=$(pipeline_owned_sync)
-  out=$(run_crew_state "$d" custody-terminal)
-  assert_not_contains "$out" "source: run-step" "terminal unknown-head run must not use run-step"
-  assert_contains "$out" "state: unknown" "terminal unknown-head run falls through to current-state sources"
-  assert_contains "$out" "source: none" "terminal run is not attributed by branch custody alone"
-  pass "pipeline-owned terminal run still requires local code identity"
+  FM_FAKE_AXI_STATUS=$(run_passed fm/feat-terminal)
+  outt=$(run_crew_state "$dt" terminal)
+  assert_not_contains "$outt" "source: run-step" "terminal unknown-head run must not use run-step"
+  assert_contains "$outt" "state: unknown" "terminal run falls through to current-state sources"
+  assert_contains "$outt" "source: none" "terminal run is not attributed by branch name alone"
+  pass "terminal or stale same-branch run still requires local code identity"
 }
 
 test_active_run_is_authoritative
@@ -1740,17 +1442,7 @@ test_historical_same_branch_rewritten_head_not_current
 test_active_run_descendant_fix_head_remains_current
 test_local_advanced_past_run_head_invalidates
 test_missing_run_head_falls_back_to_current_state
-test_pipeline_owned_recent_active_unknown_head_is_current
-test_pipeline_owned_status_custody_survives_failed_sync_probe
-test_pipeline_owned_status_without_branch_sync_uses_sync_check
-test_no_branch_sync_and_failed_probe_is_not_current
-test_pipeline_owned_reordered_columns_row_is_read_by_name
-test_reordered_columns_quiet_row_is_not_current
-test_pipeline_owned_quoted_active_row_is_current
-test_active_unknown_head_without_custody_is_not_current
-test_pipeline_owned_quiet_historical_run_is_not_current
-test_pipeline_owned_quiet_run_with_trailing_steps_table_is_not_current
-test_pipeline_owned_unknown_activity_is_not_current
-test_pipeline_owned_terminal_unknown_head_is_not_current
+test_active_recent_run_with_unknown_head_is_current
+test_terminal_or_stale_run_with_unknown_head_is_not_current
 
 echo "all fm-crew-state tests passed"
