@@ -585,14 +585,44 @@ jq -cn '{payload:{type:"token_count", info:{last_token_usage:{input_tokens:70, c
   cache_write_input_tokens:0, output_tokens:7, reasoning_output_tokens:0, total_tokens:77},
   total_token_usage:{total_tokens:77}}}}' >> "$CODEX_LINK_ROOT/archive/real.jsonl"
 ln -s "$CODEX_LINK_ROOT/archive/real.jsonl" "$CODEX_LINK_ROOT/2026/08/12/rollout-linked.jsonl"
+
+# bounded_run <seconds> <cmd...>: the same timeout -> gtimeout -> perl-alarm
+# ladder bin/fm-teardown.sh's cleanup hook uses, returning 124 when the bound
+# fires and 255 when the host offers no rung at all. Needed because the check
+# below deliberately puts a FIFO in the scan's path: if the regular-file filter
+# ever regresses, awk blocks in open() forever, and bin/fm-test-run.sh has no
+# time bound of its own - so without this the regression would wedge CI with no
+# indication of which case or why, instead of failing here in seconds.
+bounded_run() {
+  local secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $st = $?; exit($st & 127 ? 128 + ($st & 127) : $st >> 8)' \
+      "$secs" "$@"
+  else
+    return 255
+  fi
+}
+
 if mkfifo "$CODEX_LINK_ROOT/2026/08/12/rollout-wedged.jsonl" 2>/dev/null; then
   write_task_meta "$TASK_STATE" codex-link codex "$CODEX_LINK_WT"
-  CODEX_LINKJ=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_LINK_ROOT" \
-    "$LEDGER" --task codex-link --json 2>/dev/null)
-  [ "$(printf '%s' "$CODEX_LINKJ" | jq -r '[.[].session_id] | unique | join(",")')" = codexsess-linked ] \
-    || fail "codex --task resolution: a symlinked rollout must resolve exactly like a plain one, and a FIFO beside it must be skipped rather than opened, got: $CODEX_LINKJ"
+  CODEX_LINK_OUT="$TMP_ROOT/codex-link.json"
+  CODEX_LINK_RC=0
+  bounded_run 20 env FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_LINK_ROOT" \
+    "$LEDGER" --task codex-link --json > "$CODEX_LINK_OUT" 2>/dev/null || CODEX_LINK_RC=$?
   rm -f "$CODEX_LINK_ROOT/2026/08/12/rollout-wedged.jsonl"
-  pass "the codex scan reads a symlinked rollout and refuses a FIFO, matching [ -f ] on the other runtimes"
+  if [ "$CODEX_LINK_RC" = 255 ]; then
+    echo "skip: no timeout mechanism on this host, so the codex FIFO-exclusion check cannot be bounded safely"
+  else
+    [ "$CODEX_LINK_RC" != 124 ] \
+      || fail "codex --task resolution: the scan was still running after 20s with a FIFO in the day-partition, so it opened the FIFO and blocked - the regular-file filter has regressed and production would do the same against a real session root"
+    [ "$(jq -r '[.[].session_id] | unique | join(",")' "$CODEX_LINK_OUT" 2>/dev/null)" = codexsess-linked ] \
+      || fail "codex --task resolution: a symlinked rollout must resolve exactly like a plain one, and a FIFO beside it must be skipped rather than opened, got: $(cat "$CODEX_LINK_OUT" 2>/dev/null)"
+    pass "the codex scan reads a symlinked rollout and refuses a FIFO, matching [ -f ] on the other runtimes"
+  fi
 else
   echo "skip: mkfifo unavailable, so the codex scan's non-regular-file exclusion cannot be exercised here"
 fi

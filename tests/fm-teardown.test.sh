@@ -2788,7 +2788,7 @@ test_token_report_failure_never_blocks_teardown() {
 }
 
 test_token_report_hang_never_delays_teardown() {
-  local case_dir rc slow started elapsed
+  local case_dir rc slow started elapsed reporter_started reporter_secs
   command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; return 0; }
   case_dir=$(make_case token-report-hangs)
   write_meta "$case_dir" local-only ship
@@ -2806,9 +2806,14 @@ test_token_report_hang_never_delays_teardown() {
   # A regular file that is simply slow to read does reach it. Codex resolution
   # scans day-partitions with `awk 'FNR==1{...}'`, which must read a rollout's
   # entire first line before it can decide anything, so one rollout whose first
-  # line is 200MB keeps that scan busy for several seconds. Measured on the
-  # development host: ~5s of scanning against the 1s bound below, i.e. the read
-  # has to get about 5x faster than it is before this case stops crossing it.
+  # line is 200MB keeps that scan busy for seconds. Measured on the development
+  # host (macOS awk 20200816, the slowest awk this repo runs on): the awk pass
+  # alone is ~2.89s and the full resolve ~4.33s against the 1s bound below, so
+  # the margin is ~4x. That margin is a throughput race, not a guarantee - a
+  # faster awk (CI's mawk, say) may finish inside the bound - so the case does
+  # NOT assume it crosses: it asserts only when the timeout note proves the
+  # ladder fired, and skips loudly otherwise. See docs/verification/token-
+  # baseline.md for the full measurement.
   slow="$case_dir/hang-codex/2026/08/12/rollout-slow.jsonl"
   mkdir -p "$(dirname "$slow")"
   { printf '{"type":"session_meta","payload":{"id":"slow","pad":"'
@@ -2818,6 +2823,11 @@ test_token_report_hang_never_delays_teardown() {
   [ "$(wc -c < "$slow" 2>/dev/null || echo 0)" -gt 100000000 ] \
     || { echo "skip: could not build the large rollout this case needs to outlast the timeout"; rm -f "$slow"; return 0; }
 
+  # Teardown removes the task metadata, and the skip branch below has to time
+  # the reporter against this same fixture afterwards, so keep a copy.
+  mkdir -p "$case_dir/state-probe"
+  cp "$case_dir/state/task-x1.meta" "$case_dir/state-probe/task-x1.meta"
+
   started=$(date +%s)
   set +e
   FM_CODEX_SESSIONS="$case_dir/hang-codex" \
@@ -2826,7 +2836,6 @@ test_token_report_hang_never_delays_teardown() {
   rc=$?
   set -e
   elapsed=$(( $(date +%s) - started ))
-  rm -f "$slow"
 
   # Fail-open holds either way, so these are asserted before the branch.
   expect_code 0 "$rc" "token-report-hangs: cleanup must succeed when the reporter wedges"
@@ -2845,9 +2854,24 @@ test_token_report_hang_never_delays_teardown() {
   if grep -q "timed out after 1s" "$case_dir/stderr"; then
     [ "$elapsed" -lt 60 ] \
       || fail "token-report-hangs: cleanup took ${elapsed}s; a wedged reporter must be bounded, not merely eventually-finishing"
+    rm -f "$slow"
     pass "a hanging token baseline report is bounded and never delays cleanup"
   else
-    echo "skip: the reporter finished in about ${elapsed}s, inside the 1s bound, so it was never still running when the bound fired - the timeout ladder was NOT exercised on this host (this host's scan simply outran the 200MB fixture; cleanup's exit-0 and record-removal guarantees were still checked above)"
+    # The host won the race, so report the number that is actually comparable to
+    # the bound: the REPORTER's own runtime against this fixture. Teardown's
+    # total is mostly git and worktree work and says nothing about the timeout.
+    # Measuring it here rather than up front costs nothing on hosts where the
+    # bound does fire, and by definition little here - the reporter just proved
+    # it finishes inside one second.
+    reporter_started=$(date +%s)
+    set +e
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state-probe" \
+    FM_CODEX_SESSIONS="$case_dir/hang-codex" FM_DATA_OVERRIDE="$case_dir/data-probe" \
+      "$ROOT/bin/fm-token-report.sh" --task task-x1 > /dev/null 2>&1
+    set -e
+    reporter_secs=$(( $(date +%s) - reporter_started ))
+    rm -f "$slow"
+    echo "skip: the reporter read this fixture in about ${reporter_secs}s, inside the 1s bound, so it was never still running when the bound fired - the timeout ladder was NOT exercised on this host (teardown as a whole took ${elapsed}s, nearly all of it git and worktree work; cleanup's exit-0 and record-removal guarantees were still checked above)"
   fi
 }
 

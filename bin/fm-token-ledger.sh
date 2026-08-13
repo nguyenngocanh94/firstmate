@@ -455,7 +455,15 @@ fm_ledger_resolve_codex_task() {
     warn "codex: no session root at $CODEX_SESSIONS; task $id cannot be mapped"
     return 1
   fi
-  day_dirs=$(find "$CODEX_SESSIONS" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort -r | head -n "$lookback")
+  # -L for the same reason the rollout scan below uses it, and it matters more
+  # here: archived codex history is relocated as a whole YYYY/ or MM/ tree far
+  # more often than as individual rollouts, and without -L a symlinked tree
+  # contributes ZERO day-partitions, so every session under it goes silently
+  # invisible behind the ordinary "no session log matches" reason. The sibling
+  # runtimes reach their log directory through [ -d "$dir" ], which follows
+  # symlinks, so this is the parity that argument already assumed. -maxdepth 3
+  # bounds the traversal, so there is no symlink loop to chase.
+  day_dirs=$(find -L "$CODEX_SESSIONS" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort -r | head -n "$lookback")
   if [ -z "$day_dirs" ]; then
     warn "codex: no session day-partitions under $CODEX_SESSIONS; task $id cannot be mapped"
     return 1

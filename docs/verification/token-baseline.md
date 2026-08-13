@@ -237,8 +237,10 @@ Exact totals are pinned only at the recorded assistant-record count.
 Its reference cross-check self-skips when the captain's logs are absent, so the suite stays runnable on any host.
 It additionally covers pi and grok `--task` resolution against synthesized fixtures matching their documented cwd-encoding, codex `--task` resolution including the day-partition lookback bound, the three unmapped-runtime reasons being textually distinct, and the real codex cross-check described above.
 
-`tests/fm-teardown.test.sh` gains three fail-open cases: a reporter that genuinely fails (an empty session-log root, so the ledger cannot resolve a log), one that is genuinely still working when the bound fires (a rollout whose first line is 200MB), and one where a codex task's session genuinely cannot be mapped (an empty codex session root).
-All three assert cleanup still exits 0, still removes every durable task record, the hang case completes within a bound, and the codex case surfaces its specific reason on stderr.
+`tests/fm-teardown.test.sh` gains five token-report cases.
+Three are fail-open cases: a reporter that genuinely fails (an empty session-log root, so the ledger cannot resolve a log), one that is genuinely still working when the bound fires (a rollout whose first line is 200MB), and one where a codex task's session genuinely cannot be mapped (an empty codex session root).
+All three assert cleanup still exits 0 and still removes every durable task record, and the codex case surfaces its specific reason on stderr.
+The hang case additionally asserts the bound held, but only on runs where the timeout demonstrably fired - see below.
 
 How that middle case is built is load-bearing, and it took three tries to get honest.
 It first used a FIFO on the claude path, where `[ -f "$f" ]` is false for a FIFO, so the file was skipped and the reporter failed in about 0 seconds - the case passed while exercising nothing.
