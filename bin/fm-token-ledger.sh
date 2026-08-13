@@ -47,7 +47,9 @@
 # Supported harnesses and their log locations:
 #   claude  ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
 #   pi      ~/.pi/agent/sessions/<encoded-cwd>/<ts>_<id>.jsonl
-#   codex   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+#   codex   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl (day-partitioned, no
+#           cwd-encoded directory; --task resolves it by scanning each
+#           rollout's own session_meta.payload.cwd - see fm_ledger_resolve_codex_task)
 #   grok    ~/.grok/sessions/<url-encoded-cwd>/<session-id>/updates.jsonl
 #   agy     NO LOG SURFACE FOUND - see --capabilities
 # Run `fm-token-ledger.sh --capabilities` for the per-runtime declaration of
@@ -64,9 +66,13 @@
 #   --session <log>  a session log path (repeatable). The harness is detected
 #                    from the path unless --harness is given.
 #   --task <id>      resolve the session logs for a firstmate task from
-#                    state/<id>.meta (worktree= plus harness=), using the shared
-#                    attribution encoding in bin/fm-token-attrib-lib.sh. Also
-#                    stamps task_id on every record.
+#                    state/<id>.meta (worktree= plus harness=). The mapping is
+#                    per runtime: claude uses the shared attribution encoding in
+#                    bin/fm-token-attrib-lib.sh, pi and grok their own cwd
+#                    encodings, and codex - which has no cwd-encoded directory -
+#                    a bounded scan of each rollout's own session_meta.payload.cwd
+#                    (see fm_ledger_resolve_codex_task). Also stamps task_id on
+#                    every record.
 #   --harness <h>    force the parser: claude|pi|codex|grok
 #   --json           print a JSON array instead of JSONL
 #   --capabilities   print the per-runtime capability declaration and exit
@@ -78,6 +84,22 @@
 # would break the one-record-per-call identity, so it is reported and its token
 # fields are emitted as "unknown" rather than summed.
 #
+# STDERR CONTRACT - every consumer classifies on these markers, never on line
+# position, because the post-parse diagnostics below are emitted AFTER the
+# per-log loop and so can follow a failure reason:
+#   "diagnostic: <key>=<n>"   ROUTINE and expected. duplicate_usage_records is
+#                             nonzero on any ordinary Claude session; it means
+#                             the grouping contract did its job, not that
+#                             anything is wrong. Never treat this as a defect.
+#   "ASSERTION BROKEN: ..."   DEFECT. Call-level arithmetic was invalidated.
+#   "UNPARSED LINES: ..."     DEFECT. Log records were dropped, so the ledger
+#                             is measuring less than the session contains.
+#   anything else             A REASON: why this run, or one of its logs, could
+#                             not be read. This is what a caller folds into its
+#                             own summary.
+# A new routine per-runtime diagnostic must use the "diagnostic:" form so it
+# stays out of the defect set by default.
+#
 # Environment overrides (tests and unusual setups):
 #   FM_HOME / FM_ROOT_OVERRIDE   home and code root resolution (standard)
 #   FM_STATE_OVERRIDE            state dir (<id>.meta lookup)
@@ -85,8 +107,15 @@
 #   FM_CLAUDE_PROJECTS           Claude session-log root
 #   FM_PI_SESSIONS               pi session-log root
 #   FM_GROK_SESSIONS             grok session-log root
-# (codex has no worktree-derived log location, so --task cannot resolve it and
-#  there is no codex root override to set; pass --session.)
+#   FM_CODEX_SESSIONS            codex session-log root (day-partitioned)
+#   FM_CODEX_LOOKBACK_DAYS       how many of the most recent codex
+#                                day-partitions --task scans for a cwd match,
+#                                newest first (default 30, range 1-36500); a
+#                                task whose session falls outside this window
+#                                is reported unmapped rather than scanned
+#                                unboundedly, and a window outside the range is
+#                                rejected by name rather than degrading into a
+#                                raw tool error or a misleading reason
 #
 # Requires jq. Reads local files only; writes nothing.
 set -u
@@ -99,6 +128,7 @@ FM_DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CLAUDE_PROJECTS="${FM_CLAUDE_PROJECTS:-$HOME/.claude/projects}"
 PI_SESSIONS="${FM_PI_SESSIONS:-$HOME/.pi/agent/sessions}"
 GROK_SESSIONS="${FM_GROK_SESSIONS:-$HOME/.grok/sessions}"
+CODEX_SESSIONS="${FM_CODEX_SESSIONS:-$HOME/.codex/sessions}"
 
 # shellcheck source=bin/fm-token-attrib-lib.sh
 # shellcheck disable=SC1091
@@ -324,6 +354,10 @@ fm_ledger_meta_get() {
 # set HARNESS when the meta records one. A task whose worktree is gone (torn
 # down) still resolves when its session log survives, which is why the report
 # hook runs BEFORE cleanup: the encoded log dir is derived from worktree=.
+#
+# Every failure path names the harness and the exact reason, so a caller can
+# tell a runtime that is simply not resolvable (agy, an unrecognised harness)
+# from a supported runtime whose specific task log could not be found.
 fm_ledger_resolve_task() {
   local id=$1 meta wt harness dir f found=0
   meta="$FM_STATE/$id.meta"
@@ -333,21 +367,22 @@ fm_ledger_resolve_task() {
   harness=$(fm_ledger_meta_get "$meta" harness)
   [ -n "$HARNESS" ] || HARNESS=$harness
   case "${HARNESS:-}" in
-    ''|claude) dir="$CLAUDE_PROJECTS/$(fm_token_encode "$wt")" ;;
-    pi|pi-signed) HARNESS=pi; dir="$PI_SESSIONS/-$(fm_token_encode "$wt")-" ;;
+    ''|claude) HARNESS=claude; dir="$CLAUDE_PROJECTS/$(fm_token_encode "$wt")" ;;
+    # pi's rule is its own, NOT claude's fm_token_encode: only '/' becomes '-'
+    # ('.' and '_' are preserved), the path is encoded as if it had a trailing
+    # slash, and one more literal '-' wraps each end - so
+    # /Users/erics/.treehouse/x/firstmate -> --Users-erics-.treehouse-x-firstmate--
+    pi|pi-signed) HARNESS=pi; dir="$PI_SESSIONS/-$(printf '%s' "$wt/" | tr '/' '-')-" ;;
     grok) dir="$GROK_SESSIONS/$(fm_ledger_url_encode "$wt")" ;;
-    codex) dir= ;;
-    *) warn "harness $HARNESS has no resolvable log location; see --capabilities"; return 1 ;;
+    codex) fm_ledger_resolve_codex_task "$id" "$wt"; return $? ;;
+    agy) warn "agy: no log surface exists (~/.agy, ~/.antigravity and ~/.config/agy are all absent) - task $id cannot be mapped to a session log; see --capabilities"; return 1 ;;
+    *) warn "$HARNESS: unsupported for --task resolution; pass --session explicitly (see --capabilities)"; return 1 ;;
   esac
-  if [ "${HARNESS:-claude}" = codex ]; then
-    warn "codex logs are day-partitioned and carry no worktree, so --task cannot resolve them; pass --session explicitly"
-    return 1
-  fi
   if [ ! -d "$dir" ]; then
-    warn "no session log directory for task $id at $dir"
+    warn "$HARNESS: no session log directory for task $id at $dir"
     return 1
   fi
-  if [ "${HARNESS:-claude}" = grok ]; then
+  if [ "$HARNESS" = grok ]; then
     for f in "$dir"/*/updates.jsonl; do
       [ -f "$f" ] || continue
       SESSIONS+=("$f"); found=1
@@ -358,7 +393,137 @@ fm_ledger_resolve_task() {
       SESSIONS+=("$f"); found=1
     done
   fi
-  [ "$found" = 1 ] || { warn "no session logs under $dir for task $id"; return 1; }
+  [ "$found" = 1 ] || { warn "$HARNESS: no session logs under $dir for task $id"; return 1; }
+  return 0
+}
+
+# fm_ledger_resolve_codex_task <id> <worktree>: codex has no cwd-encoded
+# session directory - sessions are day-partitioned only
+# (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl) - so resolution scans each
+# rollout's own session_meta record (always logged as the first line) for an
+# exact payload.cwd match against the task's recorded worktree.
+#
+# Bounded to the most recent FM_CODEX_LOOKBACK_DAYS day-partitions (default
+# 30, sorted newest first). Every candidate file's first line is read in ONE
+# awk pass (FNR==1 + nextfile skips the rest of each file without reading
+# it), then grep -F narrows to an exact JSON-escaped "cwd":"<worktree>"
+# match before jq ever runs - a per-file jq call here was measured to take
+# over two minutes against this fleet's real history, while the batched
+# awk+grep pass takes ~5s against all 13.7k rollouts on the same host (see
+# docs/verification/token-baseline.md), so cost stays flat as codex's total
+# session history grows rather than scanning unboundedly. A task whose
+# session falls outside the window is reported unmapped, never estimated
+# from a nearby session.
+fm_ledger_resolve_codex_task() {
+  local id=$1 wt=$2 lookback=${FM_CODEX_LOOKBACK_DAYS:-30}
+  local day_dirs day day_arr firstlines_tmp pattern f found=0 cwd magnitude
+  local max_lookback=36500 below_min=0 above_max=0
+  # "not a number at all" and "a number, but out of range" are different
+  # inputs and get different answers: the former falls back to the documented
+  # default, the latter is rejected by name below. A negative value is a
+  # NUMBER, so it must reach that rejection rather than be swept into the
+  # default here - silently widening a below-minimum request to a 30-day scan
+  # is both wrong and the more expensive direction.
+  case "$lookback" in
+    -*) magnitude=${lookback#-}
+        case "$magnitude" in ''|*[!0-9]*) lookback=30 ;; *) below_min=1 ;; esac ;;
+    ''|*[!0-9]*) lookback=30 ;;
+  esac
+  # Range-check by DIGIT COUNT before any numeric comparison. A value wider
+  # than the shell's integer type makes `[ -lt ]` itself print "integer
+  # expected" and take the wrong branch, so a validator that compares first
+  # leaks exactly the raw tool error it exists to prevent. A negative value
+  # never reaches here: it is already known to be below the minimum, and its
+  # magnitude may be equally unrepresentable.
+  if [ "$below_min" = 0 ]; then
+    while [ "${#lookback}" -gt 1 ] && [ "${lookback#0}" != "$lookback" ]; do lookback=${lookback#0}; done
+    if [ "${#lookback}" -gt "${#max_lookback}" ]; then
+      above_max=1
+    elif [ "$lookback" -lt 1 ]; then
+      below_min=1
+    elif [ "$lookback" -gt "$max_lookback" ]; then
+      above_max=1
+    fi
+  fi
+  # A window outside the supported range is a caller configuration error, not
+  # a scan that found nothing. `head -n 0` is rejected outright by BSD/macOS
+  # head and returns an empty window on GNU head, and an over-range count is
+  # rejected everywhere, so without this the platform decides whether the
+  # caller sees a raw tool error or the misleading "no session day-partitions"
+  # reason. Name the real cause at both ends instead.
+  if [ "$below_min" = 1 ]; then
+    warn "codex: FM_CODEX_LOOKBACK_DAYS=$lookback scans no day-partitions at all; task $id cannot be mapped - use a window of 1 or more days"
+    return 1
+  fi
+  if [ "$above_max" = 1 ]; then
+    warn "codex: FM_CODEX_LOOKBACK_DAYS=$lookback exceeds the supported maximum of $max_lookback day-partitions; task $id cannot be mapped - use a window of $max_lookback or fewer days"
+    return 1
+  fi
+  if [ ! -d "$CODEX_SESSIONS" ]; then
+    warn "codex: no session root at $CODEX_SESSIONS; task $id cannot be mapped"
+    return 1
+  fi
+  # -L for the same reason the rollout scan below uses it, and it matters more
+  # here: archived codex history is relocated as a whole YYYY/ or MM/ tree far
+  # more often than as individual rollouts, and without -L a symlinked tree
+  # contributes ZERO day-partitions, so every session under it goes silently
+  # invisible behind the ordinary "no session log matches" reason. The sibling
+  # runtimes reach their log directory through [ -d "$dir" ], which follows
+  # symlinks, so this is the parity that argument already assumed. -maxdepth 3
+  # bounds the traversal, so there is no symlink loop to chase.
+  day_dirs=$(find -L "$CODEX_SESSIONS" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort -r | head -n "$lookback")
+  if [ -z "$day_dirs" ]; then
+    warn "codex: no session day-partitions under $CODEX_SESSIONS; task $id cannot be mapped"
+    return 1
+  fi
+  day_arr=()
+  while IFS= read -r day; do [ -n "$day" ] && day_arr+=("$day"); done <<EOF
+$day_dirs
+EOF
+  firstlines_tmp=$(mktemp "${TMPDIR:-/tmp}/fm-ledger-codex.XXXXXX") || {
+    warn "codex: cannot create a temp file to scan sessions for task $id"
+    return 1
+  }
+  # Set before the later PARSED trap exists, cleared once the explicit rm
+  # below runs, so an external kill mid-scan (the teardown hook's bound) never
+  # leaks this file and the two traps never fight over which one applies.
+  trap 'rm -f "$firstlines_tmp"' EXIT
+  trap 'rm -f "$firstlines_tmp"; exit 130' INT
+  trap 'rm -f "$firstlines_tmp"; exit 143' TERM
+  # shellcheck disable=SC2016 # single-quoted intentionally: FILENAME and $0 are awk's own variables, not the shell's
+  # -L -type f matches the [ -f "$f" ] guard on the claude, pi and grok paths:
+  # this scan opens every candidate, so without it a FIFO or device node named
+  # *.jsonl inside a day-partition would be opened and read by production, and a
+  # FIFO would block until something wrote to it. -L is what makes the parity
+  # exact rather than approximate - `test -f` follows symlinks while a bare
+  # `find -type f` lstats, so without it a rollout symlinked in from archived
+  # history (a regular file behind the link) would silently stop resolving. With
+  # -L a symlink to a regular file is -type f and a symlink to a FIFO is -type p,
+  # and -maxdepth 1 over explicit day directories leaves no traversal to loop on.
+  find -L "${day_arr[@]}" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null \
+    | xargs -0 awk 'FNR==1{print FILENAME "\t" $0; nextfile}' > "$firstlines_tmp" 2>/dev/null
+  # Raw (-r) text of the exact JSON-escaped fragment: a plain substring match
+  # against compact JSON, not a parse, is what keeps this a single grep pass.
+  pattern=$(jq -rn --arg v "$wt" '"\"cwd\":" + ($v|tojson)')
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    # Confirm with jq on the tiny grep-narrowed candidate set (rather than on
+    # every file), so an incidental substring match elsewhere in the record
+    # can never pass as a real cwd match.
+    cwd=$(head -1 "$f" 2>/dev/null | jq -r 'select(.type=="session_meta") | .payload.cwd // empty' 2>/dev/null)
+    if [ "$cwd" = "$wt" ]; then
+      SESSIONS+=("$f")
+      found=1
+    fi
+  done < <(grep -F -- "$pattern" "$firstlines_tmp" 2>/dev/null | cut -f1)
+  rm -f "$firstlines_tmp"
+  trap - EXIT
+  trap - INT
+  trap - TERM
+  [ "$found" = 1 ] || {
+    warn "codex: no session log matches worktree $wt for task $id within the last $lookback day-partitions under $CODEX_SESSIONS"
+    return 1
+  }
   return 0
 }
 
@@ -861,7 +1026,7 @@ fm_ledger_parse() {
   total=$(wc -l < "$log" | tr -d ' ')
   kept=$(jq -c . "$log" 2>/dev/null | wc -l | tr -d ' ')
   dropped=$(( total - kept ))
-  [ "$dropped" -le 0 ] || warn "$log: $dropped of $total lines did not parse as JSON and were dropped"
+  [ "$dropped" -le 0 ] || warn "UNPARSED LINES: $log: $dropped of $total lines did not parse as JSON and were dropped"
   jq -c . "$log" 2>/dev/null | jq -s \
     --arg task "$task" \
     --arg source_log "$log" \
@@ -882,7 +1047,11 @@ fm_ledger_parse() {
 # failure reaches the exit status instead of dying with a subshell.
 RC=0
 PARSED=$(mktemp "${TMPDIR:-/tmp}/fm-token-ledger.XXXXXX") || die "cannot create a temp file"
-trap 'rm -f "$PARSED"' EXIT INT TERM
+trap 'rm -f "$PARSED"' EXIT
+# As in bin/fm-token-report.sh: a signal ends the run rather than deleting the
+# scratch file and letting the rest of the script read it back.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 for log in "${SESSIONS[@]}"; do
   if [ ! -f "$log" ]; then

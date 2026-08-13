@@ -698,14 +698,21 @@ validate_pr_poll_cleanup() {
 # STRICTLY FAIL-OPEN, and deliberately so: measurement is never allowed to
 # influence cleanup. Every path here returns 0. A missing reporter, a reporter
 # that exits non-zero, a reporter that writes nothing, and a reporter that hangs
-# are all the same outcome - one line on stderr, cleanup continues. The timeout
-# is what makes "delayed" impossible as well as "blocked"; without it a wedged
-# reporter would hold a task's cleanup open indefinitely.
+# all end the same way: cleanup continues, and this hook adds AT MOST ONE line
+# of its own. The timeout is what makes "delayed" impossible as well as
+# "blocked"; without it a wedged reporter would hold a task's cleanup open
+# indefinitely.
+#
+# stderr as a whole is NOT bounded to one line. The reporter's stderr stays
+# attached (see the capture below), so its own warnings and every ledger
+# diagnostic it relays reach the raw log directly and unfiltered - an ordinary
+# successful Claude teardown now carries a routine diagnostic line where this
+# hook itself says nothing. Only this hook's own note is the one-line part.
 #
 # FM_TOKEN_REPORT_ON_TEARDOWN=0 disables it entirely.
 # FM_TOKEN_REPORT_TIMEOUT overrides the timeout in seconds (default 20).
 write_token_baseline_report() {
-  local state_dir=$1 id=$2 reporter timeout_s out
+  local state_dir=$1 id=$2 reporter timeout_s report_path rc
   [ "${FM_TOKEN_REPORT_ON_TEARDOWN:-1}" = 0 ] && return 0
   reporter="$SCRIPT_DIR/fm-token-report.sh"
   [ -x "$reporter" ] || return 0
@@ -717,26 +724,57 @@ write_token_baseline_report() {
   # without the perl rung the bound would silently vanish on the platform this
   # fleet actually runs on. With no rung at all the report is SKIPPED rather than
   # run unbounded: losing a measurement is always preferable to delaying cleanup.
-  # Every capture below MUST carry `|| true`. This script runs under `set -e`,
-  # so a bare `out=$(failing-reporter)` aborts teardown at that line - which is
-  # precisely the coupling this hook exists to avoid, and which the fail-open
-  # cases in tests/fm-teardown.test.sh caught.
+  # Every capture below MUST keep its `|| rc=$?`. This script runs under
+  # `set -e`, so a bare `report_path=$(failing-reporter)` aborts teardown at
+  # that line - which is precisely the coupling this hook exists to avoid, and
+  # which the fail-open cases in tests/fm-teardown.test.sh caught. Putting the
+  # capture on the left of `||` is what keeps a nonzero reporter from escaping.
+  #
+  # ONLY stdout is captured. The reporter's stderr - its own warnings plus every
+  # ledger diagnostic it relays - stays attached to this script's stderr, so
+  # each one reaches the raw log exactly once, as written, on both the success
+  # and the failure path. Nothing below reads that text.
+  rc=0
   if command -v timeout >/dev/null 2>&1; then
-    out=$(timeout "$timeout_s" "$reporter" --task "$id" 2>&1) || true
+    report_path=$(timeout "$timeout_s" "$reporter" --task "$id") || rc=$?
   elif command -v gtimeout >/dev/null 2>&1; then
-    out=$(gtimeout "$timeout_s" "$reporter" --task "$id" 2>&1) || true
+    report_path=$(gtimeout "$timeout_s" "$reporter" --task "$id") || rc=$?
   elif command -v perl >/dev/null 2>&1; then
-    out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
-      "$timeout_s" "$reporter" --task "$id" 2>&1) || true
+    # The exit mapping reports a signal-killed child as 128+signal, the same
+    # convention timeout(1) uses, instead of collapsing it to 0 the way a bare
+    # `$? >> 8` does - otherwise an operator's Ctrl-C or an external kill of the
+    # reporter arrives here indistinguishable from a clean success.
+    report_path=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $st = $?; exit($st & 127 ? 128 + ($st & 127) : $st >> 8)' \
+      "$timeout_s" "$reporter" --task "$id") || rc=$?
   else
     echo "note: token baseline report skipped for $id (no timeout mechanism available)" >&2
     return 0
   fi
-  if [ -n "$out" ]; then
-    case "$out" in
-      /*) : ;;  # the written report path, the success case
-      *) echo "note: token baseline report skipped for $id ($out)" >&2 ;;
-    esac
+  # The note is decided from STRUCTURED signals only - the reporter's exit
+  # status, and whether it printed a report path. On success the reporter writes
+  # exactly one thing to stdout, that path, so an empty capture or a nonzero
+  # status means no measurement exists and there is nothing to point a reader
+  # at. Classifying on diagnostic prose instead is what previously announced a
+  # written report as skipped, and what made an ordinary
+  # duplicate_usage_records count look like a defect; whatever actually went
+  # wrong has already said so on stderr above, in the reporter's own words.
+  #
+  [ "$rc" -eq 0 ] && [ -n "$report_path" ] && return 0
+  # No report exists, so say why in terms the reader can act on. Each arm is
+  # decided by rc alone - no diagnostic text is inspected - and each claims only
+  # what is true of its own case: a reporter killed by the bound or by any other
+  # signal never reached its own stderr relay, so there is nothing above to
+  # point at, whereas an ordinary nonzero exit usually did say something first.
+  # The last arm is a clean exit with no path on stdout, which is a contract
+  # violation by the reporter rather than a diagnosed failure.
+  if [ "$rc" = 124 ]; then
+    echo "note: token baseline report skipped for $id (timed out after ${timeout_s}s and was killed before it could report why)" >&2
+  elif [ "$rc" -gt 128 ]; then
+    echo "note: token baseline report skipped for $id (killed by signal $((rc - 128)) before it could report why)" >&2
+  elif [ "$rc" -ne 0 ]; then
+    echo "note: token baseline report skipped for $id (reporter exit $rc; any diagnostics it produced are above)" >&2
+  else
+    echo "note: token baseline report skipped for $id (the reporter exited cleanly but printed no report path)" >&2
   fi
   return 0
 }

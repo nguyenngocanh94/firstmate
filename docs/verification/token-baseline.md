@@ -170,6 +170,68 @@ That is a teardown since the earlier check, not an attribution regression - `mai
 
 PR 3's own regression case, `a root recorded under either name attributes its sessions instead of falling into other:` in `tests/fm-token-usage.test.sh`, passes against the extracted library unchanged.
 
+## Codex `--task` resolution: mapping a worktree with no cwd-encoded directory
+
+Codex logs are day-partitioned only (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`), so `--task` resolution scans each rollout's own `session_meta` record (always the first line) for an exact `payload.cwd` match, evidenced against this host's real codex history on 2026-08-12.
+
+A naive per-file `jq` parse of every rollout's first line is too slow to run inside the teardown hook's bound: reading and jq-parsing the first line of all 13,751 rollouts on this host measured over two minutes, well past the hook's default 20s timeout.
+The batched approach - one `awk 'FNR==1{...; nextfile}'` pass across every candidate file, `grep -F` for the exact JSON-escaped `"cwd":"<worktree>"` fragment, then `jq` only on the tiny grep-narrowed candidate set - measured at ~5s for the same 13,751 files:
+
+```console
+$ time (find ~/.codex/sessions -name "*.jsonl" -print0 | xargs -0 awk 'FNR==1{print FILENAME "\t" $0; nextfile}' | wc -l)
+13751
+( ... )  1.55s user 0.51s system 41% cpu 5.038 total
+```
+
+Resolution is bounded to the most recent `FM_CODEX_LOOKBACK_DAYS` day-partitions (default 30, range 1-36500) rather than the full history shown above, so cost stays flat as codex's total session history grows.
+A window outside that range is rejected by name at both ends.
+Below 1 it scans nothing at all, and passing it to `head -n 0` is refused outright by BSD/macOS `head` while GNU `head` accepts it.
+Above the maximum the value can exceed the shell's integer type, which makes the range check itself print `integer expected` and `head` print `illegal line count`, so the bound is checked by digit count before any numeric comparison.
+End to end against a real task worktree on this host:
+
+```console
+$ FM_HOME=<tmp> FM_STATE_OVERRIDE=<tmp>/state bin/fm-token-ledger.sh --task codex-realtest --json | jq '{calls: length}'
+{"calls": 81}
+$ FM_HOME=<tmp> FM_STATE_OVERRIDE=<tmp>/state bin/fm-token-report.sh --task codex-realtest --stdout \
+  | jq '{calls: .totals.calls, gross: .totals.gross_tokens}'
+{"calls": 81, "gross": 7999119}
+$ jq -s '[.[] | select((.payload.type // "")=="token_count")] | last | .payload.info.total_token_usage.total_tokens' \
+  ~/.codex/sessions/2026/08/12/rollout-2026-08-12T18-17-39-019ff5b1-3660-7a73-ba4b-692154dd44e3.jsonl
+7999119
+```
+
+`gross_tokens` (input+output, the codex formula) equals the runtime's own `total_token_usage.total_tokens` exactly - the report's total is not just internally consistent, it matches what codex itself reports.
+`tests/fm-token-baseline.test.sh`'s real-session cross-check reproduces this identity at test time (self-verifying rather than a pinned number, so it never rots) and self-skips when no such session exists on the host.
+
+A treehouse pool slot's absolute path is reused across many unrelated tasks over its lifetime, so an unbounded historical scan for "any session at this cwd" can return months of unrelated sessions - real fan-out, evidenced by one such lookup taking minutes once discovery followed a heavily-reused slot back through the fleet's full history.
+This is not specific to codex: claude and pi resolution glob every `*.jsonl` under a cwd-encoded directory the same way, so a reused slot's session log directory carries the same history for those runtimes too.
+It is a property of resolving by absolute path in a fleet that reuses worktree slots, not a codex-specific defect.
+
+Unmapped runtimes were confirmed to report distinct, specific reasons rather than a shared generic message:
+
+```console
+$ FM_STATE_OVERRIDE=<tmp>/state bin/fm-token-ledger.sh --task agy-task --json
+fm-token-ledger: agy: no log surface exists (~/.agy, ~/.antigravity and ~/.config/agy are all absent) - task agy-task cannot be mapped to a session log; see --capabilities
+$ FM_STATE_OVERRIDE=<tmp>/state bin/fm-token-ledger.sh --task codex-nomatch --json
+fm-token-ledger: codex: no session log matches worktree /some/worktree/that/never/existed for task codex-nomatch within the last 30 day-partitions under /Users/erics/.codex/sessions
+```
+
+## pi and grok `--task` encodings, read from real session directories
+
+The pi and grok resolution paths predate this work but had no test at all, so their encodings were confirmed against this host's real session roots on 2026-08-14 rather than against the test's own assumption:
+
+```console
+$ ls ~/.pi/agent/sessions | head -1
+--Users-erics-.treehouse-firstmate-47172b-3-firstmate--
+$ ls ~/.grok/sessions | head -1
+%2FUsers%2Ferics%2F.treehouse%2Fpersonal-finance-vault-7f5fcd%2F1%2Fpersonal-finance-vault
+```
+
+pi's rule is its own and is **not** claude's `fm_token_encode`: only `/` becomes `-`, `.` and `_` survive (`.treehouse` above, which `fm_token_encode` would have flattened), the path is encoded as if it carried a trailing slash, and one further literal `-` wraps each end.
+A fixture built from claude's encoding would have matched nothing here, which is what makes reading the real directory - not the test - the evidence.
+grok's is a plain percent-encoding of the absolute path.
+The rules themselves are owned by `bin/fm-token-ledger.sh`'s resolution code and the comment above it.
+
 ## Suites
 
 ```console
@@ -189,9 +251,41 @@ Exact totals are pinned only at the recorded assistant-record count.
 
 `tests/fm-token-baseline.test.sh` covers requestId grouping, the non-interchangeability of the Claude and Codex formulas in both directions, absent telemetry surfacing as `unknown` rather than 0, the context-composition identity plus a genuinely unattributable delta, the phase rules including `REWORK`'s exact-failure precondition and its refusal to fire on failure text alone, compaction parsed with exact magnitudes and zero events reported as measured, grok turn granularity, the private report location with its capability declaration, and the four chart renderings.
 Its reference cross-check self-skips when the captain's logs are absent, so the suite stays runnable on any host.
+It additionally covers pi and grok `--task` resolution against synthesized fixtures matching their documented cwd-encoding, codex `--task` resolution including the day-partition lookback bound, the three unmapped-runtime reasons being textually distinct, and the real codex cross-check described above.
 
-`tests/fm-teardown.test.sh` gains two fail-open cases: a reporter that genuinely fails (an empty session-log root, so the ledger cannot resolve a log) and one that genuinely hangs (a FIFO in place of the session log, which nothing ever writes to).
-Both assert cleanup still exits 0, still removes every durable task record, and in the hang case completes within a bound.
+`tests/fm-teardown.test.sh` gains five token-report cases.
+Three are fail-open cases: a reporter that genuinely fails (an empty session-log root, so the ledger cannot resolve a log), one that is genuinely still working when the bound fires (a rollout whose first line is 200MB), and one where a codex task's session genuinely cannot be mapped (an empty codex session root).
+All three assert cleanup still exits 0 and still removes every durable task record, and the codex case surfaces its specific reason on stderr.
+The hang case additionally asserts the bound held, but only on runs where the timeout demonstrably fired - see below.
+
+How that middle case is built is load-bearing, and it took three tries to get honest.
+It first used a FIFO on the claude path, where `[ -f "$f" ]` is false for a FIFO, so the file was skipped and the reporter failed in about 0 seconds - the case passed while exercising nothing.
+It then moved the FIFO to a codex day-partition, which did block, because that scan piped `find -name '*.jsonl'` straight into `awk` with no `-type f` and so opened whatever the glob matched.
+That worked only because the codex path lacked the regular-file guard the other three runtimes have, which is a real inconsistency rather than a useful property: a FIFO or device node named `*.jsonl` under `~/.codex/sessions/YYYY/MM/DD/` would have been opened and read by production.
+The guard is now present on all four paths, and the hang case no longer depends on its absence.
+It is `find -L ... -type f` rather than a bare `-type f`, because `test -f` follows symlinks while `find -type f` lstats: without `-L` a rollout symlinked in from archived history would have silently stopped resolving, which is a narrowing rather than a hardening.
+With `-L` a symlink to a regular file is `-type f` and a symlink to a FIFO is `-type p`, so the codex filter now matches `[ -f "$f" ]` exactly.
+
+The case instead uses a regular file the guards accept but that is slow to read.
+`awk 'FNR==1{...}'` must read a rollout's entire first line before it can decide anything, so a 200MB first line keeps the scan busy for several seconds against the case's 1-second bound.
+Measured on the development host (macOS, `awk version 20200816`, the slowest awk this repo runs on): the awk pass alone takes 2.89s and the full `fm-token-ledger.sh --task` resolve takes 4.33s, i.e. a margin of roughly 4x over the bound.
+Generating the fixture with the pipeline the case actually uses costs 7.76s and 7.81s wall across two runs.
+That cost is CPU-bound in BSD `tr`, so it does not vary with cache state - an earlier revision of this paragraph reported 0.4s, which came from a `python3` generator rather than the `head -c … | tr` pipeline in the test, and did not reproduce.
+
+Peak temporary disk is about 381MiB under `TMPDIR`, not the 191MiB an earlier revision claimed.
+The fixture is 191MiB, and the scan's own `firstlines_tmp` holds another 191MiB, because `awk 'FNR==1{print FILENAME "\t" $0; nextfile}'` writes that entire 200MB first line back out; both exist at once.
+The fixture's lifetime differs by branch.
+When the timeout fires it is removed as soon as teardown returns.
+On the skip path it is deliberately retained past teardown and read a second time, by an unbounded probe run of the reporter against a copy of the task metadata (`state-probe`, taken before cleanup removes the original), so the skip message can name the reporter's own runtime rather than teardown's total; only then is it removed.
+
+The margin depends entirely on which `awk` the host ships, so this is a throughput race rather than an absolute block, and the case is written to say so rather than to bet on it.
+CI runs this suite on `ubuntu-latest`, whose default `mawk` is materially faster on a single-record scan of this shape and may well finish inside the bound.
+When the timeout note is absent the case therefore SKIPS with a message naming the measured elapsed time, the 1-second bound, and the fact that the timeout ladder was not exercised on that host - it never asserts a timeout it did not observe, and never fails the host for being fast.
+The fixture is deliberately held at 200MB: growing it only moves the threshold of the same race while charging every run more disk and setup time.
+It gains two further cases covering how the hook classifies a report it did produce.
+The hook captures only the reporter's stdout - the report path, and nothing else - and leaves its stderr attached, so every relayed diagnostic reaches the raw log exactly once and the captain-facing note is decided from the reporter's exit status and that path alone, never from diagnostic text.
+One case proves a successful report whose ledger emitted the routine `duplicate_usage_records` count still writes its JSON, shows that count on stderr, and earns no note; the other proves a dropped log line reaches stderr the same way without turning a produced report into a skip.
+Classifying on message text instead is what once announced a written report as skipped.
 
 `tests/fm-token-usage.test.sh` passes unchanged after the attribution mapping moved into `bin/fm-token-attrib-lib.sh`, which is what establishes that extraction as behavior-preserving - including the two symlink-attribution cases PR 3 added to it.
 `tests/fm-path-identity.test.sh` passes unchanged, so the library the extraction now depends on is intact.

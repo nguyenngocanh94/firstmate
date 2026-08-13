@@ -69,6 +69,17 @@ A turn-granularity record covers `model_calls` model calls, a count read from th
 Its totals are exact, but per-call values that cannot exist at turn granularity - `context_size` above all - are `unknown`.
 They are never produced by dividing a turn total by the call count.
 
+## Mapping a task to its session log
+
+`fm-token-ledger.sh --task <id>` resolves a firstmate task to its session log(s) from `state/<id>.meta` (`worktree=` plus `harness=`), which is how the teardown hook in "Automatic generation on task completion" below produces a report without the caller naming a log path.
+
+Claude, pi and grok all encode a session's working directory into its log directory name, so resolution is a direct lookup.
+Codex does not: its logs are day-partitioned only (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`), so resolution instead scans each rollout's own `session_meta` record - always its first line - for an exact `cwd` match, bounded to the most recent `FM_CODEX_LOOKBACK_DAYS` day-partitions so the scan cost stays flat as codex's total session history grows.
+`agy` has no log surface at all, so no task on that runtime is ever mappable.
+Exact flags, the lookback default, and the scan mechanics are owned by `bin/fm-token-ledger.sh`'s header.
+
+A runtime that cannot be mapped says so with a reason specific to why: an unsupported runtime (`agy`, or any harness the ledger does not recognise) names itself as such, while a supported runtime whose specific task session could not be found (including codex outside its lookback window) says exactly that instead - a future reader can always tell "not supported" from "not found".
+
 ## Per-runtime capability declaration
 
 `fm-token-ledger.sh --capabilities` prints, for every supported runtime, which ledger fields it can supply and - field by field, with a reason - which it cannot.
@@ -144,9 +155,11 @@ A hard bug can cost many tokens for a few lines, so it is not a headline measure
 The ordering matters: a session log outlives cleanup, but the metadata the report needs for its identity - harness, model, worktree, PR, delivery mode - does not.
 
 That hook is **strictly fail-open**.
-Measurement never influences cleanup: the reporter runs under a hard timeout, every failure is discarded to one stderr note, and cleanup always proceeds.
+Measurement never influences cleanup: the reporter runs under a hard timeout, no failure propagates, and cleanup always proceeds.
+The hook adds at most one note of its own, and decides it from the reporter's exit status and whether a report path was printed rather than from any diagnostic text, so a report that was written is never announced as skipped.
+The reporter's own stderr stays attached rather than being swallowed, so its warnings and the ledger diagnostics it relays - including the specific reason a task could not be mapped to a session log - reach the raw log unfiltered; a routine diagnostic there is not a failure.
 Reports are published atomically, so an interrupted run leaves the previous report intact rather than a half-written one.
-`tests/fm-teardown.test.sh` proves cleanup completes both when the reporter fails and when it hangs.
+`tests/fm-teardown.test.sh` proves cleanup completes when the reporter fails, when it is still working as the bound fires, and when the task's session cannot be mapped at all.
 
 Set `FM_TOKEN_REPORT_ON_TEARDOWN=0` to disable it, or `FM_TOKEN_REPORT_TIMEOUT` to change the bound.
 

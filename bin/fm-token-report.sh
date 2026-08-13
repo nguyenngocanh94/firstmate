@@ -52,10 +52,18 @@
 # Fail-open contract: this script is invoked from task cleanup
 # (bin/fm-teardown.sh) BEFORE task metadata is cleared, because the metadata is
 # gone afterwards while the session log survives. Cleanup must never be blocked,
-# delayed, or altered by it. Teardown therefore runs it under a timeout with its
-# failure discarded; this script keeps its side of the bargain by writing the
-# report atomically (temp file + mv) so an interrupted run cannot leave a
-# half-written report behind.
+# delayed, or altered by it. Teardown therefore runs it under a timeout and
+# never propagates its failure; this script keeps its side of the bargain by
+# writing the report atomically (temp file + mv) so an interrupted run cannot
+# leave a half-written report behind.
+#
+# The stdout/stderr split is part of that bargain and is load-bearing: on the
+# write path stdout carries EXACTLY the report path and nothing else, while
+# every diagnostic - this script's own warnings plus the ledger's, which it
+# relays verbatim - goes to stderr. Teardown captures only stdout and decides
+# its note from the exit status and that path, never from diagnostic text, so
+# anything else printed on stdout would make a written report unreadable to its
+# one caller.
 #
 # Environment overrides (tests and unusual setups): as bin/fm-token-ledger.sh,
 # plus FM_DATA_OVERRIDE for the report directory.
@@ -116,7 +124,15 @@ esac
 # --- ledger acquisition -------------------------------------------------------
 
 LEDGER_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-token-report.XXXXXX") || die "cannot create a temp file"
-trap 'rm -f "$LEDGER_TMP" "$LEDGER_TMP.out"' EXIT INT TERM
+LEDGER_ERR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-token-report-err.XXXXXX") || die "cannot create a temp file"
+trap 'rm -f "$LEDGER_TMP" "$LEDGER_TMP.out" "$LEDGER_ERR_TMP"' EXIT
+# A signal must END this run, not just delete its scratch files and let it carry
+# on reading them. The teardown hook's timeout kills the reporter mid-run, and a
+# cleanup-only handler left the failure branch below grepping a file the handler
+# had just removed - so a killed report emitted raw `grep:`/`cat:` errors into
+# the captain's cleanup output. Exiting here runs the EXIT trap once and stops.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ -n "$LEDGER" ]; then
   if [ "$LEDGER" = - ]; then
@@ -131,10 +147,36 @@ else
   [ -n "$HARNESS" ] && LEDGER_ARGS+=(--harness "$HARNESS")
   for s in "${SESSIONS[@]+"${SESSIONS[@]}"}"; do LEDGER_ARGS+=(--session "$s"); done
   [ "${#LEDGER_ARGS[@]}" -gt 0 ] || die "need --ledger, --session or --task to obtain a ledger"
-  "$SCRIPT_DIR/fm-token-ledger.sh" "${LEDGER_ARGS[@]}" > "$LEDGER_TMP" || {
-    warn "the ledger could not be produced for $REPORT_ID"
+  LEDGER_RC=0
+  "$SCRIPT_DIR/fm-token-ledger.sh" "${LEDGER_ARGS[@]}" > "$LEDGER_TMP" 2> "$LEDGER_ERR_TMP" || LEDGER_RC=$?
+  # Every ledger diagnostic reaches stderr exactly once, on both paths. The
+  # ledger reports loudly on SUCCESS too - a dropped-line count, or an
+  # ASSERTION BROKEN line meaning call-level arithmetic was invalidated - and
+  # those are the diagnostics most worth seeing, so the success path relays all
+  # of them.
+  #
+  # On failure the reason is the last line that is NOT one of the ledger's
+  # self-identifying diagnostic forms (see its STDERR CONTRACT). Position alone
+  # is not enough: the ledger runs its post-parse diagnostics loop AFTER the
+  # per-log loop, so a run that both failed on one log and reported a routine
+  # diagnostic on another ends with the diagnostic. Folding "whatever came last"
+  # would name a benign data-quality note as the cause of the failure. Only the
+  # one line the summary actually carries is withheld from the relay, so no
+  # diagnostic can be lost by being dropped without being restated.
+  if [ "$LEDGER_RC" -ne 0 ]; then
+    reason_lineno=$(grep -nvE '^fm-token-ledger: (diagnostic: |ASSERTION BROKEN: |UNPARSED LINES: )' \
+      "$LEDGER_ERR_TMP" | tail -1 | cut -d: -f1)
+    if [ -n "$reason_lineno" ]; then
+      reason=$(sed -n "${reason_lineno}p" "$LEDGER_ERR_TMP" | sed 's/^fm-token-ledger: //')
+      sed "${reason_lineno}d" "$LEDGER_ERR_TMP" >&2
+    else
+      reason=
+      cat "$LEDGER_ERR_TMP" >&2
+    fi
+    warn "the ledger could not be produced for $REPORT_ID${reason:+: $reason}"
     exit 1
-  }
+  fi
+  cat "$LEDGER_ERR_TMP" >&2
 fi
 
 [ -s "$LEDGER_TMP" ] || die "the ledger for $REPORT_ID is empty; nothing to report"

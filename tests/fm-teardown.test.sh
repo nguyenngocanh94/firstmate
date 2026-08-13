@@ -2788,39 +2788,227 @@ test_token_report_failure_never_blocks_teardown() {
 }
 
 test_token_report_hang_never_delays_teardown() {
-  local case_dir rc encoded started elapsed
+  local case_dir rc slow started elapsed reporter_started reporter_secs
+  command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; return 0; }
   case_dir=$(make_case token-report-hangs)
   write_meta "$case_dir" local-only ship
+  printf 'harness=codex\n' >> "$case_dir/state/task-x1.meta"
   wt_commit "$case_dir" "fix the thing"
   add_fork_with_pushed_branch "$case_dir"
 
-  # A FIFO in place of the session log makes the reporter block for real when it
-  # reads it: nothing ever writes to the other end. Claude Code encodes a
-  # worktree path by turning every "/" and "." into "-".
-  encoded=$(printf '%s' "$case_dir/wt" | tr '/.' '--')
-  mkdir -p "$case_dir/hang-projects/$encoded"
-  mkfifo "$case_dir/hang-projects/$encoded/wedged.jsonl" 2>/dev/null \
-    || { echo "skip: mkfifo unavailable"; return 0; }
+  # The reporter has to be still working when the bound fires, and it has to get
+  # there through the ledger's real read path against unmodified production
+  # code. A FIFO cannot do it: every runtime path now refuses non-regular files
+  # (`[ -f "$f" ]` on claude/pi/grok, `-type f` on the codex scan), so a FIFO is
+  # skipped and the reporter fails in ~0s, proving nothing. Those guards are a
+  # real protection and must not be loosened for a test's benefit.
+  #
+  # A regular file that is simply slow to read does reach it. Codex resolution
+  # scans day-partitions with `awk 'FNR==1{...}'`, which must read a rollout's
+  # entire first line before it can decide anything, so one rollout whose first
+  # line is 200MB keeps that scan busy for seconds. Measured on the development
+  # host (macOS awk 20200816, the slowest awk this repo runs on): the awk pass
+  # alone is ~2.89s and the full resolve ~4.33s against the 1s bound below, so
+  # the margin is ~4x. That margin is a throughput race, not a guarantee - a
+  # faster awk (CI's mawk, say) may finish inside the bound - so the case does
+  # NOT assume it crosses: it asserts only when the timeout note proves the
+  # ladder fired, and skips loudly otherwise. See docs/verification/token-
+  # baseline.md for the full measurement.
+  slow="$case_dir/hang-codex/2026/08/12/rollout-slow.jsonl"
+  mkdir -p "$(dirname "$slow")"
+  { printf '{"type":"session_meta","payload":{"id":"slow","pad":"'
+    head -c 200000000 /dev/zero 2>/dev/null | tr '\0' a
+    printf '","cwd":"/nowhere-this-task-ever-ran"}}\n'
+  } > "$slow" 2>/dev/null
+  [ "$(wc -c < "$slow" 2>/dev/null || echo 0)" -gt 100000000 ] \
+    || { echo "skip: could not build the large rollout this case needs to outlast the timeout"; rm -f "$slow"; return 0; }
+
+  # Teardown removes the task metadata, and the skip branch below has to time
+  # the reporter against this same fixture afterwards, so keep a copy.
+  mkdir -p "$case_dir/state-probe"
+  cp "$case_dir/state/task-x1.meta" "$case_dir/state-probe/task-x1.meta"
 
   started=$(date +%s)
   set +e
-  FM_CLAUDE_PROJECTS="$case_dir/hang-projects" \
-  FM_TOKEN_REPORT_TIMEOUT=2 \
+  FM_CODEX_SESSIONS="$case_dir/hang-codex" \
+  FM_TOKEN_REPORT_TIMEOUT=1 \
     run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
   elapsed=$(( $(date +%s) - started ))
 
+  # Fail-open holds either way, so these are asserted before the branch.
   expect_code 0 "$rc" "token-report-hangs: cleanup must succeed when the reporter wedges"
   assert_absent "$case_dir/state/task-x1.meta" \
     "token-report-hangs: cleanup must still remove the task metadata"
-  [ "$elapsed" -lt 60 ] \
-    || fail "token-report-hangs: cleanup took ${elapsed}s; a wedged reporter must be bounded, not merely eventually-finishing"
-  # Unlink the FIFO rather than writing to it: with its reader killed by the
-  # timeout there is no reader left, and opening a FIFO for write blocks until
-  # one appears - which would wedge this test instead of the thing it measures.
-  rm -f "$case_dir/hang-projects/$encoded/wedged.jsonl"
-  pass "a hanging token baseline report is bounded and never delays cleanup"
+
+  # Whether the reporter was STILL RUNNING when the bound fired is a race
+  # between the bound and this host's scan throughput, and the honest verdict
+  # differs by outcome. The timeout note appears only on rc=124, so its presence
+  # is proof the ladder fired and the case can assert. Its absence means the
+  # scan finished first: this run did not exercise a hang, so asserting the
+  # timeout fired would be a lie and failing would blame the host for being
+  # fast. It skips instead - loudly, naming what was not covered. The fixture is
+  # deliberately NOT grown to buy margin: a bigger one only moves the threshold
+  # on the same race, at the cost of temp disk and setup time on every run.
+  #
+  # The note's absence has two causes that must not be conflated. A host with no
+  # timeout/gtimeout/perl rung makes the hook skip the reporter outright, so no
+  # bound was ever applied and nothing about the race was measured; claiming
+  # anything "inside the 1s bound" there would be false.
+  if grep -q "timed out after 1s" "$case_dir/stderr"; then
+    [ "$elapsed" -lt 60 ] \
+      || fail "token-report-hangs: cleanup took ${elapsed}s; a wedged reporter must be bounded, not merely eventually-finishing"
+    rm -f "$slow"
+    pass "a hanging token baseline report is bounded and never delays cleanup"
+  elif grep -q "no timeout mechanism available" "$case_dir/stderr"; then
+    rm -f "$slow"
+    echo "skip: this host ships none of timeout, gtimeout or perl, so the cleanup hook skipped the reporter rather than bounding it - no bound was applied and the timeout ladder was NOT exercised here (cleanup's exit-0 and record-removal guarantees were still checked above)"
+  else
+    # The host won the race, so report the number that is actually comparable to
+    # the bound: the REPORTER's own runtime against this fixture. Teardown's
+    # total is mostly git and worktree work and says nothing about the timeout.
+    # Measuring it here rather than up front costs nothing on hosts where the
+    # bound does fire, and by definition little here - the reporter just proved
+    # it finishes inside one second.
+    reporter_started=$(date +%s)
+    set +e
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state-probe" \
+    FM_CODEX_SESSIONS="$case_dir/hang-codex" FM_DATA_OVERRIDE="$case_dir/data-probe" \
+      "$ROOT/bin/fm-token-report.sh" --task task-x1 > /dev/null 2>&1
+    set -e
+    reporter_secs=$(( $(date +%s) - reporter_started ))
+    rm -f "$slow"
+    echo "skip: the reporter read this fixture in about ${reporter_secs}s, inside the 1s bound, so it was never still running when the bound fired - the timeout ladder was NOT exercised on this host (teardown as a whole took ${elapsed}s, nearly all of it git and worktree work; cleanup's exit-0 and record-removal guarantees were still checked above)"
+  fi
+}
+
+# Codex has no cwd-encoded session directory (bin/fm-token-ledger.sh scans
+# day-partitioned rollouts by session_meta.cwd instead - see
+# fm_ledger_resolve_codex_task). An empty codex session root is a real,
+# genuine failure of that new path, not a stub, and the fail-open guarantee
+# must hold for it exactly as it does for the claude path above.
+test_token_report_codex_unmapped_never_blocks_teardown() {
+  local case_dir rc
+  case_dir=$(make_case token-report-codex-unmapped)
+  write_meta "$case_dir" local-only ship
+  printf 'harness=codex\n' >> "$case_dir/state/task-x1.meta"
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  mkdir -p "$case_dir/empty-codex-sessions"
+
+  set +e
+  FM_CODEX_SESSIONS="$case_dir/empty-codex-sessions" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "token-report-codex-unmapped: cleanup must succeed when codex resolution fails"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "token-report-codex-unmapped: cleanup must still remove the task metadata"
+  assert_grep "token baseline report skipped" "$case_dir/stderr" \
+    "token-report-codex-unmapped: the skip must be reported on stderr, not silently swallowed"
+  assert_grep "codex: no session day-partitions" "$case_dir/stderr" \
+    "token-report-codex-unmapped: the specific codex reason must reach stderr, not be replaced by a generic note"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "token-report-codex-unmapped: an unmapped codex session must not turn into a teardown refusal"
+  pass "an unmapped codex session never blocks or alters cleanup, and names the specific reason"
+}
+
+# write_claude_session <file> <requestid-count-shape>: a minimal real Claude
+# session log. Two records SHARE requestId r1, which is the ordinary shape of a
+# single API response written as several content blocks - so the ledger reports
+# diagnostic: duplicate_usage_records=1 on an otherwise perfect exit-0 run.
+write_claude_session() {
+  local f=$1 uuid parent
+  mkdir -p "$(dirname "$f")"
+  : > "$f"
+  local n=1
+  for uuid in u1 u2; do
+    [ "$n" = 1 ] && parent="" || parent=u1
+    jq -cn --arg uuid "$uuid" --arg parent "$parent" '{
+      type:"assistant", timestamp:"2026-08-12T06:00:00.000Z", uuid:$uuid,
+      parentUuid:(if $parent == "" then null else $parent end),
+      requestId:"r1", sessionId:"sess-teardown", isSidechain:false,
+      message:{ model:"claude-opus-5", content:[{type:"text"}],
+        usage:{ input_tokens:10, cache_creation_input_tokens:100,
+                cache_read_input_tokens:1000, output_tokens:50,
+                output_tokens_details:{thinking_tokens:0},
+                iterations:[{type:"message"}] } } }' >> "$f"
+    n=2
+  done
+}
+
+# The reporter's diagnostics pass straight through to teardown's stderr, and the
+# captain-facing note is decided ONLY from the reporter's exit status and
+# whether it produced a report path. A report that SUCCEEDS while the ledger
+# prints its routine duplicate_usage_records diagnostic must therefore show that
+# diagnostic on the raw log and earn no note: the diagnostic is expected output
+# on any ordinary Claude session, and reading it to decide what to print is what
+# previously announced a written report as skipped.
+test_token_report_routine_diagnostic_passes_through_without_a_note() {
+  local case_dir rc encoded report
+  command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; return 0; }
+  case_dir=$(make_case token-report-routine-diagnostic)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  encoded=$(printf '%s' "$case_dir/wt" | tr '/.' '--')
+  write_claude_session "$case_dir/claude-projects/$encoded/sess-teardown.jsonl"
+
+  set +e
+  FM_CLAUDE_PROJECTS="$case_dir/claude-projects" FM_DATA_OVERRIDE="$case_dir/data" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "token-report-routine-diagnostic: cleanup must succeed"
+  report="$case_dir/data/token-reports/task-x1.json"
+  [ -s "$report" ] \
+    || fail "token-report-routine-diagnostic: the report must actually be written to disk, $report is missing or empty"
+  jq -e '.totals.gross_tokens' "$report" >/dev/null \
+    || fail "token-report-routine-diagnostic: the written report must be usable JSON with totals"
+  assert_grep "duplicate_usage_records" "$case_dir/stderr" \
+    "token-report-routine-diagnostic: the routine diagnostic must reach the raw log, not be swallowed"
+  ! grep -q "token baseline report skipped" "$case_dir/stderr" \
+    || fail "token-report-routine-diagnostic: a report that WAS written must never be announced as skipped: $(cat "$case_dir/stderr")"
+  ! grep -q "^note: token baseline report" "$case_dir/stderr" \
+    || fail "token-report-routine-diagnostic: a produced report must earn no captain-facing note: $(cat "$case_dir/stderr")"
+  pass "a successful report's routine diagnostics reach the raw log and earn no captain-facing note"
+}
+
+# The other half of the same contract: a diagnostic that DOES mean the
+# measurement is incomplete reaches the raw log through the same pass-through,
+# so nothing has to recognise it by name for it to survive - and it still does
+# not turn a produced report into a skip.
+test_token_report_defect_diagnostic_reaches_the_raw_log() {
+  local case_dir rc encoded
+  command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; return 0; }
+  case_dir=$(make_case token-report-defect-diagnostic)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "fix the thing"
+  add_fork_with_pushed_branch "$case_dir"
+
+  encoded=$(printf '%s' "$case_dir/wt" | tr '/.' '--')
+  write_claude_session "$case_dir/claude-projects/$encoded/sess-teardown.jsonl"
+  printf 'this line is not json\n' >> "$case_dir/claude-projects/$encoded/sess-teardown.jsonl"
+
+  set +e
+  FM_CLAUDE_PROJECTS="$case_dir/claude-projects" FM_DATA_OVERRIDE="$case_dir/data" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "token-report-defect-diagnostic: cleanup must succeed"
+  [ -s "$case_dir/data/token-reports/task-x1.json" ] \
+    || fail "token-report-defect-diagnostic: the report must still be written despite the dropped line"
+  assert_grep "did not parse as JSON and were dropped" "$case_dir/stderr" \
+    "token-report-defect-diagnostic: the dropped-line diagnostic must reach the raw log"
+  ! grep -q "token baseline report skipped" "$case_dir/stderr" \
+    || fail "token-report-defect-diagnostic: a dropped line must not turn a produced report into a skip: $(cat "$case_dir/stderr")"
+  pass "a dropped log line reaches the raw log without turning a produced report into a skip"
 }
 
 test_local_only_fork_remote_allows
@@ -2888,3 +3076,6 @@ test_leased_worktree_still_aborts_teardown
 test_symlinked_name_still_refuses_unlanded_work
 test_token_report_failure_never_blocks_teardown
 test_token_report_hang_never_delays_teardown
+test_token_report_codex_unmapped_never_blocks_teardown
+test_token_report_routine_diagnostic_passes_through_without_a_note
+test_token_report_defect_diagnostic_reaches_the_raw_log
