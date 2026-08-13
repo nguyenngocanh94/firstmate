@@ -9,8 +9,8 @@
 # re-validates), the log's last line stays stale. This helper never infers the
 # current state from a tail of the log: it reads the authoritative source (a
 # no-mistakes run-step attributed to this crew's branch and current code
-# identity, else the pane busy-signature) and reconciles the possibly-stale log
-# against it.
+# identity (or to a recently-active run while the pipeline owns the branch),
+# else the pane busy-signature) and reconciles the possibly-stale log against it.
 #
 # The determinism lives entirely here - only run-step / pane / log reads plus
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
@@ -28,6 +28,12 @@
 #      is an ancestor of the run head (pipeline fix commits advanced the run on
 #      the same line of history). Local work that advanced past the run head, or
 #      diverged from it, invalidates attribution.
+#      One active-only exception covers the pipeline-owned window where its fix
+#      commits are not objects in the crew worktree: a same-branch run also
+#      matches when `active_steps` reports running/fixing with non-quiet recent
+#      activity and a fresh read-only `axi sync --check` reports pipeline_owned.
+#      Terminal, cancelled, parked, quiet, or activity-unknown runs still require
+#      the ordinary code-identity match.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -381,6 +387,56 @@ nm_coarse_head_matches_worktree() {  # <short-sha>
   fm_nm_head_matches_worktree "$WT" "$1"
 }
 
+# `axi status` exposes active execution in a dedicated table with columns
+# step,status,active_for,last_activity,agent_pid,round. The CLI prefixes
+# last_activity with "quiet" after its configured step_quiet_warning and emits
+# "unknown" when no activity timestamp exists. Accept only a running/fixing row
+# whose activity is neither condition; that is the CLI's own current liveness
+# signal, not a locally invented age threshold.
+nm_run_has_recent_active_step() {
+  local status outcome
+  status=$(strip_quotes "$(nm_field status)")
+  outcome=$(strip_quotes "$(nm_field outcome)")
+  [ -z "$outcome" ] || return 1
+  case "$status" in running|fixing|ci) ;; *) return 1 ;; esac
+  printf '%s\n' "$RUN_OUT" | awk '
+    /^[[:space:]]*active_steps\[[0-9]+\]\{step,status,active_for,last_activity,agent_pid,round\}:[[:space:]]*$/ {
+      in_active = 1
+      next
+    }
+    in_active {
+      row = $0
+      sub(/^[[:space:]]+/, "", row)
+      count = split(row, field, ",")
+      activity = field[4]
+      sub(/^[[:space:]\"]+/, "", activity)
+      sub(/[[:space:]\"]+$/, "", activity)
+      if (count >= 4 && (field[2] == "running" || field[2] == "fixing") &&
+          activity != "" && activity != "unknown" && activity !~ /^quiet([[:space:]]|$)/) {
+        found = 1
+        exit
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+# `axi sync --check` is the CLI's read-only branch-custody read. Its scoped
+# branch_sync.state is pipeline_owned only while the current branch remains in
+# pipeline custody; every blocked, terminal-recovery, and user-owned state is a
+# rejection here.
+nm_pipeline_owns_branch() {
+  local sync_out sync_state
+  sync_out=$(nm_run axi sync --check)
+  sync_state=$(printf '%s\n' "$sync_out" | sed -n '
+    /^[[:space:]]*branch_sync:[[:space:]]*$/,/^[^[:space:]]/ {
+      s/^[[:space:]]*state:[[:space:]]*//p
+    }
+  ' | head -1)
+  sync_state=$(strip_quotes "$sync_state")
+  [ "$sync_state" = pipeline_owned ]
+}
+
 HAVE_RUN=0
 # RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
 # $RUN_OUT is real `axi status` TOON with step/gate detail; "coarse" means only
@@ -394,9 +450,13 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] && nm_run_head_matches_worktree; then
-      HAVE_RUN=1
-    else
+    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
+      if nm_run_head_matches_worktree \
+        || { nm_run_has_recent_active_step && nm_pipeline_owns_branch; }; then
+        HAVE_RUN=1
+      fi
+    fi
+    if [ "$HAVE_RUN" != 1 ]; then
       # The active-or-most-recent run is for another branch, or same branch with
       # a rewritten/diverged head (the CLI is alive and answered; only the
       # attribution missed) - try the coarse fallback.
