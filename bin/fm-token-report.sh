@@ -117,7 +117,14 @@ esac
 
 LEDGER_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-token-report.XXXXXX") || die "cannot create a temp file"
 LEDGER_ERR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-token-report-err.XXXXXX") || die "cannot create a temp file"
-trap 'rm -f "$LEDGER_TMP" "$LEDGER_TMP.out" "$LEDGER_ERR_TMP"' EXIT INT TERM
+trap 'rm -f "$LEDGER_TMP" "$LEDGER_TMP.out" "$LEDGER_ERR_TMP"' EXIT
+# A signal must END this run, not just delete its scratch files and let it carry
+# on reading them. The teardown hook's timeout kills the reporter mid-run, and a
+# cleanup-only handler left the failure branch below grepping a file the handler
+# had just removed - so a killed report emitted raw `grep:`/`cat:` errors into
+# the captain's cleanup output. Exiting here runs the EXIT trap once and stops.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ -n "$LEDGER" ]; then
   if [ "$LEDGER" = - ]; then

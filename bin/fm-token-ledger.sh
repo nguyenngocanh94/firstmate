@@ -471,7 +471,9 @@ EOF
   # Set before the later PARSED trap exists, cleared once the explicit rm
   # below runs, so an external kill mid-scan (the teardown hook's bound) never
   # leaks this file and the two traps never fight over which one applies.
-  trap 'rm -f "$firstlines_tmp"' EXIT INT TERM
+  trap 'rm -f "$firstlines_tmp"' EXIT
+  trap 'rm -f "$firstlines_tmp"; exit 130' INT
+  trap 'rm -f "$firstlines_tmp"; exit 143' TERM
   # shellcheck disable=SC2016 # single-quoted intentionally: FILENAME and $0 are awk's own variables, not the shell's
   find "${day_arr[@]}" -maxdepth 1 -name '*.jsonl' -print0 2>/dev/null \
     | xargs -0 awk 'FNR==1{print FILENAME "\t" $0; nextfile}' > "$firstlines_tmp" 2>/dev/null
@@ -490,7 +492,9 @@ EOF
     fi
   done < <(grep -F -- "$pattern" "$firstlines_tmp" 2>/dev/null | cut -f1)
   rm -f "$firstlines_tmp"
-  trap - EXIT INT TERM
+  trap - EXIT
+  trap - INT
+  trap - TERM
   [ "$found" = 1 ] || {
     warn "codex: no session log matches worktree $wt for task $id within the last $lookback day-partitions under $CODEX_SESSIONS"
     return 1
@@ -1018,7 +1022,11 @@ fm_ledger_parse() {
 # failure reaches the exit status instead of dying with a subshell.
 RC=0
 PARSED=$(mktemp "${TMPDIR:-/tmp}/fm-token-ledger.XXXXXX") || die "cannot create a temp file"
-trap 'rm -f "$PARSED"' EXIT INT TERM
+trap 'rm -f "$PARSED"' EXIT
+# As in bin/fm-token-report.sh: a signal ends the run rather than deleting the
+# scratch file and letting the rest of the script read it back.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 for log in "${SESSIONS[@]}"; do
   if [ ! -f "$log" ]; then

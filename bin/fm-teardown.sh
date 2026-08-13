@@ -698,9 +698,16 @@ validate_pr_poll_cleanup() {
 # STRICTLY FAIL-OPEN, and deliberately so: measurement is never allowed to
 # influence cleanup. Every path here returns 0. A missing reporter, a reporter
 # that exits non-zero, a reporter that writes nothing, and a reporter that hangs
-# are all the same outcome - one line on stderr, cleanup continues. The timeout
-# is what makes "delayed" impossible as well as "blocked"; without it a wedged
-# reporter would hold a task's cleanup open indefinitely.
+# all end the same way: cleanup continues, and this hook adds AT MOST ONE line
+# of its own. The timeout is what makes "delayed" impossible as well as
+# "blocked"; without it a wedged reporter would hold a task's cleanup open
+# indefinitely.
+#
+# stderr as a whole is NOT bounded to one line. The reporter's stderr stays
+# attached (see the capture below), so its own warnings and every ledger
+# diagnostic it relays reach the raw log directly and unfiltered - an ordinary
+# successful Claude teardown now carries a routine diagnostic line where this
+# hook itself says nothing. Only this hook's own note is the one-line part.
 #
 # FM_TOKEN_REPORT_ON_TEARDOWN=0 disables it entirely.
 # FM_TOKEN_REPORT_TIMEOUT overrides the timeout in seconds (default 20).
@@ -747,8 +754,16 @@ write_token_baseline_report() {
   # written report as skipped, and what made an ordinary
   # duplicate_usage_records count look like a defect; whatever actually went
   # wrong has already said so on stderr above, in the reporter's own words.
-  if [ "$rc" -ne 0 ] || [ -z "$report_path" ]; then
-    echo "note: token baseline report skipped for $id (reporter exit $rc; see the diagnostics above)" >&2
+  #
+  # The wording stays honest about what the reader will actually find above. A
+  # reporter killed by the bound never reached its own stderr relay, so there
+  # are no diagnostics to point at and the exit status is the whole story; every
+  # other failure may or may not have said something first. rc alone tells the
+  # two apart, so neither case needs the diagnostic text inspected.
+  if [ "$rc" = 124 ]; then
+    echo "note: token baseline report skipped for $id (timed out after ${timeout_s}s and was killed before it could report why)" >&2
+  elif [ "$rc" -ne 0 ] || [ -z "$report_path" ]; then
+    echo "note: token baseline report skipped for $id (reporter exit $rc; any diagnostics it produced are above)" >&2
   fi
   return 0
 }
