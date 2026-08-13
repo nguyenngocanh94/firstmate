@@ -1649,6 +1649,29 @@ test_pipeline_owned_quiet_historical_run_is_not_current() {
   pass "pipeline-owned quiet historical run is not attributed"
 }
 
+# The CLI emits `unknown` for last_activity when no activity timestamp exists at
+# all, which is the absence of a liveness signal rather than a fresh one. Without
+# proof of recent activity the exception must not fire, so this run falls through
+# exactly like a quiet one.
+test_pipeline_owned_unknown_activity_is_not_current() {
+  reset_fakes
+  local d out
+  d=$(new_case pipeline-owned-activity-unknown)
+  make_repo_on_branch "$d/wt" fm/feat-custody-activity-unknown
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/custody-activity-unknown.meta" "window=fm:fm-custody-activity-unknown" \
+    "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'resolved: old pipeline decision closed\n' > "$d/state/custody-activity-unknown.status"
+  arm_idle_record "$d/state" custody-activity-unknown
+  FM_FAKE_RUN_HEAD=cccccccccccccccccccccccccccccccccccccccc
+  FM_FAKE_AXI_STATUS=$(run_pipeline_owned_active fm/feat-custody-activity-unknown unknown pipeline_owned)
+  out=$(run_crew_state "$d" custody-activity-unknown)
+  assert_not_contains "$out" "source: run-step" "activity-unknown run must not use run-step"
+  assert_contains "$out" "state: unknown" "activity-unknown run falls through to current-state sources"
+  assert_contains "$out" "source: none" "an absent activity timestamp is not recent activity"
+  pass "pipeline-owned run with unknown last_activity is not attributed"
+}
+
 test_pipeline_owned_terminal_unknown_head_is_not_current() {
   reset_fakes
   local d out
@@ -1727,6 +1750,7 @@ test_pipeline_owned_quoted_active_row_is_current
 test_active_unknown_head_without_custody_is_not_current
 test_pipeline_owned_quiet_historical_run_is_not_current
 test_pipeline_owned_quiet_run_with_trailing_steps_table_is_not_current
+test_pipeline_owned_unknown_activity_is_not_current
 test_pipeline_owned_terminal_unknown_head_is_not_current
 
 echo "all fm-crew-state tests passed"
