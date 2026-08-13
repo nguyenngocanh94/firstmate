@@ -134,20 +134,25 @@ else
   [ "${#LEDGER_ARGS[@]}" -gt 0 ] || die "need --ledger, --session or --task to obtain a ledger"
   LEDGER_RC=0
   "$SCRIPT_DIR/fm-token-ledger.sh" "${LEDGER_ARGS[@]}" > "$LEDGER_TMP" 2> "$LEDGER_ERR_TMP" || LEDGER_RC=$?
-  # The ledger reports every diagnostic loudly and does so on SUCCESS too - a
-  # dropped-line count, or an ASSERTION BROKEN line meaning call-level
-  # arithmetic was invalidated. Those are the diagnostics most worth seeing, so
-  # relay stderr unconditionally rather than only when the ledger failed.
-  cat "$LEDGER_ERR_TMP" >&2
+  # Every ledger diagnostic reaches stderr exactly once, on both paths. The
+  # ledger reports loudly on SUCCESS too - a dropped-line count, or an
+  # ASSERTION BROKEN line meaning call-level arithmetic was invalidated - and
+  # those are the diagnostics most worth seeing, so the success path relays all
+  # of them. On failure the LAST line is the specific reason, which the summary
+  # below folds in verbatim; relaying it here as well would print the same
+  # sentence twice into the teardown hook's combined capture, so the failure
+  # path relays everything EXCEPT that line and lets the summary carry it.
   if [ "$LEDGER_RC" -ne 0 ]; then
+    sed '$d' "$LEDGER_ERR_TMP" >&2
     # The ledger's own diagnostics already name the harness and the exact
     # reason (unsupported runtime vs a supported one whose specific session
-    # could not be found); fold the LAST such line into the summary so a
-    # reader never sees only the generic "could not be produced" phrase.
+    # could not be found); fold that reason into the summary so a reader never
+    # sees only the generic "could not be produced" phrase.
     reason=$(tail -1 "$LEDGER_ERR_TMP" | sed 's/^fm-token-ledger: //')
     warn "the ledger could not be produced for $REPORT_ID${reason:+: $reason}"
     exit 1
   fi
+  cat "$LEDGER_ERR_TMP" >&2
 fi
 
 [ -s "$LEDGER_TMP" ] || die "the ledger for $REPORT_ID is empty; nothing to report"

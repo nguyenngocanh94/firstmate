@@ -183,8 +183,10 @@ $ time (find ~/.codex/sessions -name "*.jsonl" -print0 | xargs -0 awk 'FNR==1{pr
 ( ... )  1.55s user 0.51s system 41% cpu 5.038 total
 ```
 
-Resolution is bounded to the most recent `FM_CODEX_LOOKBACK_DAYS` day-partitions (default 30, minimum 1) rather than the full history shown above, so cost stays flat as codex's total session history grows.
-A window below 1 scans nothing at all, so it is rejected by name rather than passed to `head -n 0`, which BSD/macOS `head` refuses outright while GNU `head` accepts.
+Resolution is bounded to the most recent `FM_CODEX_LOOKBACK_DAYS` day-partitions (default 30, range 1-36500) rather than the full history shown above, so cost stays flat as codex's total session history grows.
+A window outside that range is rejected by name at both ends.
+Below 1 it scans nothing at all, and passing it to `head -n 0` is refused outright by BSD/macOS `head` while GNU `head` accepts it.
+Above the maximum the value can exceed the shell's integer type, which makes the range check itself print `integer expected` and `head` print `illegal line count`, so the bound is checked by digit count before any numeric comparison.
 End to end against a real task worktree on this host:
 
 ```console

@@ -90,11 +90,12 @@
 #   FM_CODEX_SESSIONS            codex session-log root (day-partitioned)
 #   FM_CODEX_LOOKBACK_DAYS       how many of the most recent codex
 #                                day-partitions --task scans for a cwd match,
-#                                newest first (default 30, minimum 1); a task
-#                                whose session falls outside this window is
-#                                reported unmapped rather than scanned
-#                                unboundedly, and a window below 1 is rejected
-#                                by name rather than scanning nothing silently
+#                                newest first (default 30, range 1-36500); a
+#                                task whose session falls outside this window
+#                                is reported unmapped rather than scanned
+#                                unboundedly, and a window outside the range is
+#                                rejected by name rather than degrading into a
+#                                raw tool error or a misleading reason
 #
 # Requires jq. Reads local files only; writes nothing.
 set -u
@@ -392,6 +393,7 @@ fm_ledger_resolve_task() {
 fm_ledger_resolve_codex_task() {
   local id=$1 wt=$2 lookback=${FM_CODEX_LOOKBACK_DAYS:-30}
   local day_dirs day day_arr firstlines_tmp pattern f found=0 cwd magnitude
+  local max_lookback=36500 below_min=0 above_max=0
   # "not a number at all" and "a number, but out of range" are different
   # inputs and get different answers: the former falls back to the documented
   # default, the latter is rejected by name below. A negative value is a
@@ -400,16 +402,37 @@ fm_ledger_resolve_codex_task() {
   # is both wrong and the more expensive direction.
   case "$lookback" in
     -*) magnitude=${lookback#-}
-        case "$magnitude" in ''|*[!0-9]*) lookback=30 ;; esac ;;
+        case "$magnitude" in ''|*[!0-9]*) lookback=30 ;; *) below_min=1 ;; esac ;;
     ''|*[!0-9]*) lookback=30 ;;
   esac
-  # A window below one day is a caller configuration error, not a scan that
-  # found nothing: `head -n 0` is rejected outright by BSD/macOS head and
-  # returns an empty window on GNU head, so without this the platform decides
-  # whether the caller sees a raw tool error or the misleading "no session
-  # day-partitions" reason. Name the real cause instead.
-  if [ "$lookback" -lt 1 ]; then
+  # Range-check by DIGIT COUNT before any numeric comparison. A value wider
+  # than the shell's integer type makes `[ -lt ]` itself print "integer
+  # expected" and take the wrong branch, so a validator that compares first
+  # leaks exactly the raw tool error it exists to prevent. A negative value
+  # never reaches here: it is already known to be below the minimum, and its
+  # magnitude may be equally unrepresentable.
+  if [ "$below_min" = 0 ]; then
+    while [ "${#lookback}" -gt 1 ] && [ "${lookback#0}" != "$lookback" ]; do lookback=${lookback#0}; done
+    if [ "${#lookback}" -gt "${#max_lookback}" ]; then
+      above_max=1
+    elif [ "$lookback" -lt 1 ]; then
+      below_min=1
+    elif [ "$lookback" -gt "$max_lookback" ]; then
+      above_max=1
+    fi
+  fi
+  # A window outside the supported range is a caller configuration error, not
+  # a scan that found nothing. `head -n 0` is rejected outright by BSD/macOS
+  # head and returns an empty window on GNU head, and an over-range count is
+  # rejected everywhere, so without this the platform decides whether the
+  # caller sees a raw tool error or the misleading "no session day-partitions"
+  # reason. Name the real cause at both ends instead.
+  if [ "$below_min" = 1 ]; then
     warn "codex: FM_CODEX_LOOKBACK_DAYS=$lookback scans no day-partitions at all; task $id cannot be mapped - use a window of 1 or more days"
+    return 1
+  fi
+  if [ "$above_max" = 1 ]; then
+    warn "codex: FM_CODEX_LOOKBACK_DAYS=$lookback exceeds the supported maximum of $max_lookback day-partitions; task $id cannot be mapped - use a window of $max_lookback or fewer days"
     return 1
   fi
   if [ ! -d "$CODEX_SESSIONS" ]; then

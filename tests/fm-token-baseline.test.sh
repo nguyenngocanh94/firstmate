@@ -591,11 +591,35 @@ for BAD_LOOKBACK in 0 -1; do
     fail "codex --task resolution: a lookback of $BAD_LOOKBACK must not leak a raw head(1) error, got: $CODEXERR"
   fi
 done
+# The high end is the same class of input and must be rejected the same clean
+# way. A value wider than the shell's integer type makes the range check itself
+# print "integer expected" and head(1) print "illegal line count", so a
+# validator that compares numerically before bounding the digit count leaks
+# exactly the raw tool errors it exists to prevent.
+for BIG_LOOKBACK in 36501 99999999999999999999; do
+  CODEXERR=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_ROOT" FM_CODEX_LOOKBACK_DAYS="$BIG_LOOKBACK" \
+    "$LEDGER" --task codex-task --json 2>&1 1>/dev/null)
+  CODEXOUT=$(FM_STATE_OVERRIDE="$TASK_STATE" FM_CODEX_SESSIONS="$CODEX_ROOT" FM_CODEX_LOOKBACK_DAYS="$BIG_LOOKBACK" \
+    "$LEDGER" --task codex-task --json 2>/dev/null)
+  printf '%s\n' "$CODEXERR" | grep -qF "FM_CODEX_LOOKBACK_DAYS=$BIG_LOOKBACK exceeds the supported maximum" \
+    || fail "codex --task resolution: a lookback of $BIG_LOOKBACK must name itself as out of range, got: $CODEXERR"
+  [ -z "$CODEXOUT" ] \
+    || fail "codex --task resolution: a lookback of $BIG_LOOKBACK must resolve nothing, got: $CODEXOUT"
+  if printf '%s\n' "$CODEXERR" | grep -qE 'illegal line count|integer expected'; then
+    fail "codex --task resolution: a lookback of $BIG_LOOKBACK must not leak a raw shell or head(1) error, got: $CODEXERR"
+  fi
+  if printf '%s\n' "$CODEXERR" | grep -qF 'no session day-partitions under'; then
+    fail "codex --task resolution: a lookback of $BIG_LOOKBACK must not claim the day-partitions are missing, got: $CODEXERR"
+  fi
+done
 # Genuinely unparseable input is a DIFFERENT case and keeps the documented
-# 30-day default, so the rejection above cannot be over-applied to it.
+# 30-day default, so neither rejection can be over-applied to it. Leading zeros
+# are a formatting quirk of a perfectly valid number, not out-of-range input.
 [ "$(codex_sessions_at_lookback not-a-number)" = codexsess-match,codexsess-stale ] \
   || fail "codex --task resolution: a non-numeric lookback must fall back to the documented 30-day default, got: $(codex_sessions_at_lookback not-a-number)"
-pass "a below-minimum codex lookback (0 or negative) reports its own cause, while unparseable input still defaults to 30"
+[ "$(codex_sessions_at_lookback 0002)" = codexsess-match ] \
+  || fail "codex --task resolution: a zero-padded lookback must be read as its numeric value, got: $(codex_sessions_at_lookback 0002)"
+pass "a codex lookback outside the supported range (0, negative or oversized) reports its own cause, while unparseable input still defaults to 30"
 
 # --- 12. unmapped runtimes name the SPECIFIC reason, not a generic phrase ----
 #
@@ -623,11 +647,17 @@ printf '%s\n' "$CODEX_NOMATCH_ERR" | grep -qF 'codex: no session log matches wor
   || fail "the three unmapped-runtime reasons must be textually distinct: agy=[$AGY_ERR] unknown=[$UNKNOWN_ERR] codex=[$CODEX_NOMATCH_ERR]"
 
 # The report wrapper must fold the ledger's specific reason into its own
-# message rather than only ever saying the generic "could not be produced".
+# message rather than only ever saying the generic "could not be produced" -
+# and must say it ONCE. bin/fm-teardown.sh captures this with 2>&1 into a single
+# parenthesized skip note, so relaying the ledger's reason AND folding the same
+# sentence into the summary would print it twice to the captain.
 REPORT_ERR=$(FM_STATE_OVERRIDE="$TASK_STATE" "$REPORT" --task agy-task 2>&1 1>/dev/null)
 printf '%s\n' "$REPORT_ERR" | grep -qF 'agy: no log surface exists' \
   || fail "fm-token-report.sh must surface the ledger's specific per-runtime reason, got: $REPORT_ERR"
-pass "unmapped runtimes report a specific, distinct reason instead of a generic failure"
+REPORT_REASON_COUNT=$(printf '%s\n' "$REPORT_ERR" | grep -cF 'agy: no log surface exists')
+[ "$REPORT_REASON_COUNT" = 1 ] \
+  || fail "fm-token-report.sh must state the ledger's reason exactly once, saw it $REPORT_REASON_COUNT times in: $REPORT_ERR"
+pass "unmapped runtimes report a specific, distinct reason instead of a generic failure, stated exactly once"
 
 # A claude task whose metadata records no harness= still resolves through the
 # claude branch, so its failure message must name claude rather than degrade to
@@ -729,6 +759,20 @@ if [ -n "${REAL_CODEX_LOG:-}" ] && [ -f "$REAL_CODEX_LOG" ]; then
   REAL_ID=$(basename "$REAL_CODEX_LOG" | sed -n 's/.*-\([0-9a-f-]\{36\}\)\.jsonl$/\1/p')
   REAL_STATE="$TMP_ROOT/real-codex-state"
   write_task_meta "$REAL_STATE" real-codex-task codex "$REAL_WT"
+  # This block reads LIVE host data that nothing here owns or can freeze, so
+  # every hard assertion below is first gated on the data having held still.
+  # real_codex_sig is the file's size+mtime; real_codex_window is the set of
+  # day-partitions the lookback covers. A codex session writing concurrently,
+  # or midnight rolling a new partition into the window, are ordinary host
+  # conditions and must self-skip - only a genuine disagreement between the
+  # ledger and the runtime's own numbers may redden the suite.
+  real_codex_sig() {
+    stat -f '%z %m' "$1" 2>/dev/null || stat -c '%s %Y' "$1" 2>/dev/null
+  }
+  real_codex_window() {
+    find "$REAL_CODEX_ROOT" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort -r | head -n "$REAL_LOOKBACK"
+  }
+  REAL_SIG_BEFORE=$(real_codex_sig "$REAL_CODEX_LOG")
   REAL_MATCH_COUNT=$(FM_STATE_OVERRIDE="$REAL_STATE" FM_CODEX_LOOKBACK_DAYS="$REAL_LOOKBACK" \
     "$LEDGER" --task real-codex-task --json 2>/dev/null | jq '[.[].session_id] | unique | length')
   # 0 and >1 mean opposite things and must not share a branch. Discovery above
@@ -737,11 +781,19 @@ if [ -n "${REAL_CODEX_LOG:-}" ] && [ -f "$REAL_CODEX_LOG" ]; then
   # even produce) means --task resolution failed to find a session the test
   # knows is there, which is the exact regression this cross-check exists to
   # catch and must be loud. Only >1 is the benign reused-pool-slot condition.
+  # Both loud branches are gated on the window not having shifted underneath
+  # them: a partition rolling in drops the oldest one out, which can legitimately
+  # carry the discovered log out of scope without anything being broken.
+  REAL_WINDOW_STABLE=1
   case "${REAL_MATCH_COUNT:-}" in
-    ''|*[!0-9]*)
-      fail "real codex session: the ledger produced no usable session count for worktree $REAL_WT (discovered via $REAL_CODEX_LOG) - --task resolution failed outright" ;;
+    1) : ;;
+    *) [ "$(real_codex_window)" = "$REAL_DAY_DIRS" ] || REAL_WINDOW_STABLE=0 ;;
   esac
-  if [ "$REAL_MATCH_COUNT" -eq 0 ]; then
+  if [ "$REAL_WINDOW_STABLE" = 0 ]; then
+    echo "skip: codex's most recent $REAL_LOOKBACK day-partitions changed between discovery and resolution (a new partition rolled in), so the discovered log may no longer be in scope - skipping rather than reporting a false regression"
+  elif [ -z "${REAL_MATCH_COUNT:-}" ] || [ -n "$(printf '%s' "${REAL_MATCH_COUNT:-}" | tr -d '0-9')" ]; then
+    fail "real codex session: the ledger produced no usable session count for worktree $REAL_WT (discovered via $REAL_CODEX_LOG) - --task resolution failed outright"
+  elif [ "$REAL_MATCH_COUNT" -eq 0 ]; then
     fail "real codex session: $REAL_CODEX_LOG records cwd $REAL_WT within the last $REAL_LOOKBACK day-partitions, but the ledger's --task resolution found no session for it - the codex resolution path is broken"
   elif [ "$REAL_MATCH_COUNT" -ne 1 ]; then
     # The exact-total cross-check below reads ONE file's own running total, so
@@ -768,11 +820,23 @@ if [ -n "${REAL_CODEX_LOG:-}" ] && [ -f "$REAL_CODEX_LOG" ]; then
       REAL_SESSIONS=$(printf '%s' "$REAL_REPORT" | jq -r '.identity.sessions[]')
       printf '%s\n' "$REAL_SESSIONS" | grep -qF "$REAL_ID" \
         || fail "real codex session: report did not resolve the expected rollout (id $REAL_ID), sessions were: $REAL_SESSIONS"
-      RUNTIME_TOTAL=$(jq -s '[.[] | select((.payload.type // "")=="token_count")] | last | .payload.info.total_token_usage.total_tokens' "$REAL_CODEX_LOG")
+      RUNTIME_TOTAL=$(jq -s '[.[] | select((.payload.type // "")=="token_count")] | last | .payload.info.total_token_usage.total_tokens' "$REAL_CODEX_LOG" 2>/dev/null)
       REPORT_GROSS=$(printf '%s' "$REAL_REPORT" | jq '.totals.gross_tokens')
-      [ "$REPORT_GROSS" = "$RUNTIME_TOTAL" ] \
-        || fail "real codex session: report gross_tokens ($REPORT_GROSS) must equal the runtime's own running total ($RUNTIME_TOTAL)"
-      pass "a real codex session resolves by --task and its gross_tokens matches the runtime's own reported total exactly"
+      REAL_SIG_AFTER=$(real_codex_sig "$REAL_CODEX_LOG")
+      # The ledger read this file during the report run; the runtime total is
+      # read from it again here. If it grew or was rewritten in between, the two
+      # numbers describe different states of a session still being written - and
+      # a torn in-flight last line can make the jq -s pass above yield nothing at
+      # all. Either way that is the host writing, not the code disagreeing.
+      if [ -z "$REAL_SIG_BEFORE" ] || [ "$REAL_SIG_AFTER" != "$REAL_SIG_BEFORE" ]; then
+        echo "skip: $REAL_CODEX_LOG changed while the cross-check ran (a live codex session is still writing it) - skipping the exact-total comparison"
+      elif [ -z "$RUNTIME_TOTAL" ] || [ "$RUNTIME_TOTAL" = null ]; then
+        echo "skip: $REAL_CODEX_LOG carries no readable running total (an in-flight or truncated record) - skipping the exact-total comparison"
+      else
+        [ "$REPORT_GROSS" = "$RUNTIME_TOTAL" ] \
+          || fail "real codex session: report gross_tokens ($REPORT_GROSS) must equal the runtime's own running total ($RUNTIME_TOTAL)"
+        pass "a real codex session resolves by --task and its gross_tokens matches the runtime's own reported total exactly"
+      fi
     fi
   fi
 else
