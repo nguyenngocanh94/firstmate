@@ -705,7 +705,7 @@ validate_pr_poll_cleanup() {
 # FM_TOKEN_REPORT_ON_TEARDOWN=0 disables it entirely.
 # FM_TOKEN_REPORT_TIMEOUT overrides the timeout in seconds (default 20).
 write_token_baseline_report() {
-  local state_dir=$1 id=$2 reporter timeout_s out report_path defects
+  local state_dir=$1 id=$2 reporter timeout_s report_path rc
   [ "${FM_TOKEN_REPORT_ON_TEARDOWN:-1}" = 0 ] && return 0
   reporter="$SCRIPT_DIR/fm-token-report.sh"
   [ -x "$reporter" ] || return 0
@@ -717,44 +717,38 @@ write_token_baseline_report() {
   # without the perl rung the bound would silently vanish on the platform this
   # fleet actually runs on. With no rung at all the report is SKIPPED rather than
   # run unbounded: losing a measurement is always preferable to delaying cleanup.
-  # Every capture below MUST carry `|| true`. This script runs under `set -e`,
-  # so a bare `out=$(failing-reporter)` aborts teardown at that line - which is
-  # precisely the coupling this hook exists to avoid, and which the fail-open
-  # cases in tests/fm-teardown.test.sh caught.
+  # Every capture below MUST keep its `|| rc=$?`. This script runs under
+  # `set -e`, so a bare `report_path=$(failing-reporter)` aborts teardown at
+  # that line - which is precisely the coupling this hook exists to avoid, and
+  # which the fail-open cases in tests/fm-teardown.test.sh caught. Putting the
+  # capture on the left of `||` is what keeps a nonzero reporter from escaping.
+  #
+  # ONLY stdout is captured. The reporter's stderr - its own warnings plus every
+  # ledger diagnostic it relays - stays attached to this script's stderr, so
+  # each one reaches the raw log exactly once, as written, on both the success
+  # and the failure path. Nothing below reads that text.
+  rc=0
   if command -v timeout >/dev/null 2>&1; then
-    out=$(timeout "$timeout_s" "$reporter" --task "$id" 2>&1) || true
+    report_path=$(timeout "$timeout_s" "$reporter" --task "$id") || rc=$?
   elif command -v gtimeout >/dev/null 2>&1; then
-    out=$(gtimeout "$timeout_s" "$reporter" --task "$id" 2>&1) || true
+    report_path=$(gtimeout "$timeout_s" "$reporter" --task "$id") || rc=$?
   elif command -v perl >/dev/null 2>&1; then
-    out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
-      "$timeout_s" "$reporter" --task "$id" 2>&1) || true
+    report_path=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
+      "$timeout_s" "$reporter" --task "$id") || rc=$?
   else
     echo "note: token baseline report skipped for $id (no timeout mechanism available)" >&2
     return 0
   fi
-  # stdout (the written report path) and stderr (the reporter's and the
-  # ledger's diagnostics) are captured together above, so classify on whether a
-  # report path was produced AT ALL rather than on what the first line happens
-  # to be. A report that succeeded while also warning is a produced report, not
-  # a skip, and saying otherwise would tell the reader no measurement exists
-  # when one does.
-  #
-  # A produced report only earns a note when a diagnostic signals a genuine
-  # DEFECT. The set is defined positively, from the ledger's own stderr markers,
-  # so a new routine per-runtime diagnostic stays silent here by default: the
-  # routine "diagnostic: <key>=<n>" form is expected output (duplicate_usage_
-  # records is nonzero on any ordinary Claude session) and noting it every
-  # teardown would read as "this measurement is wrong" when nothing is, drowning
-  # the two signals that do mean that. Both notes are collapsed to a single line
-  # to keep this hook's one-line-on-stderr contract.
-  if [ -n "$out" ]; then
-    report_path=$(printf '%s\n' "$out" | grep -m1 '^/' || true)
-    defects=$(printf '%s\n' "$out" | grep -E 'ASSERTION BROKEN:|UNPARSED LINES:' || true)
-    if [ -z "$report_path" ]; then
-      echo "note: token baseline report skipped for $id ($(printf '%s' "$out" | tr '\n' ' '))" >&2
-    elif [ -n "$defects" ]; then
-      echo "note: token baseline report written for $id with measurement defects ($(printf '%s' "$defects" | tr '\n' ' '))" >&2
-    fi
+  # The note is decided from STRUCTURED signals only - the reporter's exit
+  # status, and whether it printed a report path. On success the reporter writes
+  # exactly one thing to stdout, that path, so an empty capture or a nonzero
+  # status means no measurement exists and there is nothing to point a reader
+  # at. Classifying on diagnostic prose instead is what previously announced a
+  # written report as skipped, and what made an ordinary
+  # duplicate_usage_records count look like a defect; whatever actually went
+  # wrong has already said so on stderr above, in the reporter's own words.
+  if [ "$rc" -ne 0 ] || [ -z "$report_path" ]; then
+    echo "note: token baseline report skipped for $id (reporter exit $rc; see the diagnostics above)" >&2
   fi
   return 0
 }

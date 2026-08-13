@@ -239,6 +239,10 @@ It additionally covers pi and grok `--task` resolution against synthesized fixtu
 
 `tests/fm-teardown.test.sh` gains three fail-open cases: a reporter that genuinely fails (an empty session-log root, so the ledger cannot resolve a log), one that genuinely hangs (a FIFO in place of the session log, which nothing ever writes to), and one where a codex task's session genuinely cannot be mapped (an empty codex session root).
 All three assert cleanup still exits 0, still removes every durable task record, the hang case completes within a bound, and the codex case surfaces its specific reason on stderr.
+It gains two further cases covering how the hook classifies a report it did produce.
+The hook captures only the reporter's stdout - the report path, and nothing else - and leaves its stderr attached, so every relayed diagnostic reaches the raw log exactly once and the captain-facing note is decided from the reporter's exit status and that path alone, never from diagnostic text.
+One case proves a successful report whose ledger emitted the routine `duplicate_usage_records` count still writes its JSON, shows that count on stderr, and earns no note; the other proves a dropped log line reaches stderr the same way without turning a produced report into a skip.
+Classifying on message text instead is what once announced a written report as skipped.
 
 `tests/fm-token-usage.test.sh` passes unchanged after the attribution mapping moved into `bin/fm-token-attrib-lib.sh`, which is what establishes that extraction as behavior-preserving - including the two symlink-attribution cases PR 3 added to it.
 `tests/fm-path-identity.test.sh` passes unchanged, so the library the extraction now depends on is intact.

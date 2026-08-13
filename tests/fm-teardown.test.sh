@@ -2850,7 +2850,7 @@ test_token_report_codex_unmapped_never_blocks_teardown() {
   assert_grep "token baseline report skipped" "$case_dir/stderr" \
     "token-report-codex-unmapped: the skip must be reported on stderr, not silently swallowed"
   assert_grep "codex: no session day-partitions" "$case_dir/stderr" \
-    "token-report-codex-unmapped: the specific codex reason must reach the skip note, not a generic message"
+    "token-report-codex-unmapped: the specific codex reason must reach stderr, not be replaced by a generic note"
   ! grep -q REFUSED "$case_dir/stderr" \
     || fail "token-report-codex-unmapped: an unmapped codex session must not turn into a teardown refusal"
   pass "an unmapped codex session never blocks or alters cleanup, and names the specific reason"
@@ -2880,12 +2880,14 @@ write_claude_session() {
   done
 }
 
-# A report that SUCCEEDS while the ledger prints its routine
-# duplicate_usage_records diagnostic must be reported as written, not as
-# skipped, and must not earn a note at all - that diagnostic is expected output
-# on any ordinary Claude session, so noting it would fire on effectively every
-# teardown and drown the two diagnostics that do mean something is wrong.
-test_token_report_routine_diagnostic_is_not_a_defect() {
+# The reporter's diagnostics pass straight through to teardown's stderr, and the
+# captain-facing note is decided ONLY from the reporter's exit status and
+# whether it produced a report path. A report that SUCCEEDS while the ledger
+# prints its routine duplicate_usage_records diagnostic must therefore show that
+# diagnostic on the raw log and earn no note: the diagnostic is expected output
+# on any ordinary Claude session, and reading it to decide what to print is what
+# previously announced a written report as skipped.
+test_token_report_routine_diagnostic_passes_through_without_a_note() {
   local case_dir rc encoded report
   command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; return 0; }
   case_dir=$(make_case token-report-routine-diagnostic)
@@ -2908,17 +2910,20 @@ test_token_report_routine_diagnostic_is_not_a_defect() {
     || fail "token-report-routine-diagnostic: the report must actually be written to disk, $report is missing or empty"
   jq -e '.totals.gross_tokens' "$report" >/dev/null \
     || fail "token-report-routine-diagnostic: the written report must be usable JSON with totals"
+  assert_grep "duplicate_usage_records" "$case_dir/stderr" \
+    "token-report-routine-diagnostic: the routine diagnostic must reach the raw log, not be swallowed"
   ! grep -q "token baseline report skipped" "$case_dir/stderr" \
     || fail "token-report-routine-diagnostic: a report that WAS written must never be announced as skipped: $(cat "$case_dir/stderr")"
-  ! grep -q "measurement defects" "$case_dir/stderr" \
-    || fail "token-report-routine-diagnostic: a routine duplicate_usage_records diagnostic must not be reported as a defect: $(cat "$case_dir/stderr")"
-  pass "a successful report carrying only routine diagnostics is neither announced as skipped nor flagged as defective"
+  ! grep -q "^note: token baseline report" "$case_dir/stderr" \
+    || fail "token-report-routine-diagnostic: a produced report must earn no captain-facing note: $(cat "$case_dir/stderr")"
+  pass "a successful report's routine diagnostics reach the raw log and earn no captain-facing note"
 }
 
 # The other half of the same contract: a diagnostic that DOES mean the
-# measurement is incomplete must still surface, so narrowing the note cannot
-# silence the signals it exists for.
-test_token_report_defect_diagnostic_still_notes() {
+# measurement is incomplete reaches the raw log through the same pass-through,
+# so nothing has to recognise it by name for it to survive - and it still does
+# not turn a produced report into a skip.
+test_token_report_defect_diagnostic_reaches_the_raw_log() {
   local case_dir rc encoded
   command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; return 0; }
   case_dir=$(make_case token-report-defect-diagnostic)
@@ -2939,11 +2944,11 @@ test_token_report_defect_diagnostic_still_notes() {
   expect_code 0 "$rc" "token-report-defect-diagnostic: cleanup must succeed"
   [ -s "$case_dir/data/token-reports/task-x1.json" ] \
     || fail "token-report-defect-diagnostic: the report must still be written despite the dropped line"
-  assert_grep "measurement defects" "$case_dir/stderr" \
-    "token-report-defect-diagnostic: a dropped log line must still earn a note"
   assert_grep "did not parse as JSON and were dropped" "$case_dir/stderr" \
-    "token-report-defect-diagnostic: the note must name the specific defect"
-  pass "a dropped log line still surfaces as a measurement defect on an otherwise successful report"
+    "token-report-defect-diagnostic: the dropped-line diagnostic must reach the raw log"
+  ! grep -q "token baseline report skipped" "$case_dir/stderr" \
+    || fail "token-report-defect-diagnostic: a dropped line must not turn a produced report into a skip: $(cat "$case_dir/stderr")"
+  pass "a dropped log line reaches the raw log without turning a produced report into a skip"
 }
 
 test_local_only_fork_remote_allows
@@ -3012,5 +3017,5 @@ test_symlinked_name_still_refuses_unlanded_work
 test_token_report_failure_never_blocks_teardown
 test_token_report_hang_never_delays_teardown
 test_token_report_codex_unmapped_never_blocks_teardown
-test_token_report_routine_diagnostic_is_not_a_defect
-test_token_report_defect_diagnostic_still_notes
+test_token_report_routine_diagnostic_passes_through_without_a_note
+test_token_report_defect_diagnostic_reaches_the_raw_log
