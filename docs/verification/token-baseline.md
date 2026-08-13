@@ -183,7 +183,8 @@ $ time (find ~/.codex/sessions -name "*.jsonl" -print0 | xargs -0 awk 'FNR==1{pr
 ( ... )  1.55s user 0.51s system 41% cpu 5.038 total
 ```
 
-Resolution is bounded to the most recent `FM_CODEX_LOOKBACK_DAYS` day-partitions (default 30) rather than the full history shown above, so cost stays flat as codex's total session history grows.
+Resolution is bounded to the most recent `FM_CODEX_LOOKBACK_DAYS` day-partitions (default 30, minimum 1) rather than the full history shown above, so cost stays flat as codex's total session history grows.
+A window below 1 scans nothing at all, so it is rejected by name rather than passed to `head -n 0`, which BSD/macOS `head` refuses outright while GNU `head` accepts.
 End to end against a real task worktree on this host:
 
 ```console

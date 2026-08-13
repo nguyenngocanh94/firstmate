@@ -132,12 +132,18 @@ else
   [ -n "$HARNESS" ] && LEDGER_ARGS+=(--harness "$HARNESS")
   for s in "${SESSIONS[@]+"${SESSIONS[@]}"}"; do LEDGER_ARGS+=(--session "$s"); done
   [ "${#LEDGER_ARGS[@]}" -gt 0 ] || die "need --ledger, --session or --task to obtain a ledger"
-  if ! "$SCRIPT_DIR/fm-token-ledger.sh" "${LEDGER_ARGS[@]}" > "$LEDGER_TMP" 2> "$LEDGER_ERR_TMP"; then
+  LEDGER_RC=0
+  "$SCRIPT_DIR/fm-token-ledger.sh" "${LEDGER_ARGS[@]}" > "$LEDGER_TMP" 2> "$LEDGER_ERR_TMP" || LEDGER_RC=$?
+  # The ledger reports every diagnostic loudly and does so on SUCCESS too - a
+  # dropped-line count, or an ASSERTION BROKEN line meaning call-level
+  # arithmetic was invalidated. Those are the diagnostics most worth seeing, so
+  # relay stderr unconditionally rather than only when the ledger failed.
+  cat "$LEDGER_ERR_TMP" >&2
+  if [ "$LEDGER_RC" -ne 0 ]; then
     # The ledger's own diagnostics already name the harness and the exact
     # reason (unsupported runtime vs a supported one whose specific session
     # could not be found); fold the LAST such line into the summary so a
     # reader never sees only the generic "could not be produced" phrase.
-    cat "$LEDGER_ERR_TMP" >&2
     reason=$(tail -1 "$LEDGER_ERR_TMP" | sed 's/^fm-token-ledger: //')
     warn "the ledger could not be produced for $REPORT_ID${reason:+: $reason}"
     exit 1

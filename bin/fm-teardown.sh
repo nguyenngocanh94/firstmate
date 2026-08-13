@@ -705,7 +705,7 @@ validate_pr_poll_cleanup() {
 # FM_TOKEN_REPORT_ON_TEARDOWN=0 disables it entirely.
 # FM_TOKEN_REPORT_TIMEOUT overrides the timeout in seconds (default 20).
 write_token_baseline_report() {
-  local state_dir=$1 id=$2 reporter timeout_s out
+  local state_dir=$1 id=$2 reporter timeout_s out report_path noise
   [ "${FM_TOKEN_REPORT_ON_TEARDOWN:-1}" = 0 ] && return 0
   reporter="$SCRIPT_DIR/fm-token-report.sh"
   [ -x "$reporter" ] || return 0
@@ -732,11 +732,20 @@ write_token_baseline_report() {
     echo "note: token baseline report skipped for $id (no timeout mechanism available)" >&2
     return 0
   fi
+  # stdout (the written report path) and stderr (the reporter's and the
+  # ledger's diagnostics) are captured together above, so classify on whether a
+  # report path was produced AT ALL rather than on what the first line happens
+  # to be. A report that succeeded while also warning - a dropped log line, an
+  # ASSERTION BROKEN - is a produced report, not a skip, and saying otherwise
+  # would tell the reader no measurement exists when one does.
   if [ -n "$out" ]; then
-    case "$out" in
-      /*) : ;;  # the written report path, the success case
-      *) echo "note: token baseline report skipped for $id ($out)" >&2 ;;
-    esac
+    report_path=$(printf '%s\n' "$out" | grep -m1 '^/' || true)
+    noise=$(printf '%s\n' "$out" | grep -v '^/' || true)
+    if [ -z "$report_path" ]; then
+      echo "note: token baseline report skipped for $id ($out)" >&2
+    elif [ -n "$noise" ]; then
+      echo "note: token baseline report written for $id with diagnostics ($noise)" >&2
+    fi
   fi
   return 0
 }

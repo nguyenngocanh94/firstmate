@@ -90,9 +90,11 @@
 #   FM_CODEX_SESSIONS            codex session-log root (day-partitioned)
 #   FM_CODEX_LOOKBACK_DAYS       how many of the most recent codex
 #                                day-partitions --task scans for a cwd match,
-#                                newest first (default 30); a task whose
-#                                session falls outside this window is reported
-#                                unmapped rather than scanned unboundedly
+#                                newest first (default 30, minimum 1); a task
+#                                whose session falls outside this window is
+#                                reported unmapped rather than scanned
+#                                unboundedly, and a window below 1 is rejected
+#                                by name rather than scanning nothing silently
 #
 # Requires jq. Reads local files only; writes nothing.
 set -u
@@ -344,7 +346,7 @@ fm_ledger_resolve_task() {
   harness=$(fm_ledger_meta_get "$meta" harness)
   [ -n "$HARNESS" ] || HARNESS=$harness
   case "${HARNESS:-}" in
-    ''|claude) dir="$CLAUDE_PROJECTS/$(fm_token_encode "$wt")" ;;
+    ''|claude) HARNESS=claude; dir="$CLAUDE_PROJECTS/$(fm_token_encode "$wt")" ;;
     pi|pi-signed) HARNESS=pi; dir="$PI_SESSIONS/-$(fm_token_encode "$wt")-" ;;
     grok) dir="$GROK_SESSIONS/$(fm_ledger_url_encode "$wt")" ;;
     codex) fm_ledger_resolve_codex_task "$id" "$wt"; return $? ;;
@@ -355,7 +357,7 @@ fm_ledger_resolve_task() {
     warn "$HARNESS: no session log directory for task $id at $dir"
     return 1
   fi
-  if [ "${HARNESS:-claude}" = grok ]; then
+  if [ "$HARNESS" = grok ]; then
     for f in "$dir"/*/updates.jsonl; do
       [ -f "$f" ] || continue
       SESSIONS+=("$f"); found=1
@@ -391,6 +393,15 @@ fm_ledger_resolve_codex_task() {
   local id=$1 wt=$2 lookback=${FM_CODEX_LOOKBACK_DAYS:-30}
   local day_dirs day day_arr firstlines_tmp pattern f found=0 cwd
   case "$lookback" in ''|*[!0-9]*) lookback=30 ;; esac
+  # A window below one day is a caller configuration error, not a scan that
+  # found nothing: `head -n 0` is rejected outright by BSD/macOS head and
+  # returns an empty window on GNU head, so without this the platform decides
+  # whether the caller sees a raw tool error or the misleading "no session
+  # day-partitions" reason. Name the real cause instead.
+  if [ "$lookback" -lt 1 ]; then
+    warn "codex: FM_CODEX_LOOKBACK_DAYS=$lookback scans no day-partitions at all; task $id cannot be mapped - use a window of 1 or more days"
+    return 1
+  fi
   if [ ! -d "$CODEX_SESSIONS" ]; then
     warn "codex: no session root at $CODEX_SESSIONS; task $id cannot be mapped"
     return 1
