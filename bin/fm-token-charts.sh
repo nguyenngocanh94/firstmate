@@ -353,7 +353,7 @@ def turn_bars($rep):
       ([ $ok[].marginal_tokens ] | max) as $mx
       | (if $mx > 0 then $mx else 1 end) as $md
       | "<p class=\"legend\">"
-        + ([ "captain-interaction", "wake-handling" ]
+        + (reduce $ok[].trigger_class as $k ([]; if index($k) then . else . + [$k] end)
            | map(turn_class(.) | "<span><span class=\"key\" style=\"background:\(.fill)\"></span>\(.vi | esc)</span>")
            | join(""))
         + "</p>"

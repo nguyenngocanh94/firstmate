@@ -638,7 +638,8 @@ function splitBar(marginal, cacheRead, scale){
 function render(d){
   const age = Date.now() - d.generated_ms;
   const stale = document.getElementById('stale');
-  if (age > 180000){
+  const staleMs = Math.max(180000, 3 * (d.interval_seconds || 60) * 1000);
+  if (age > staleMs){
     stale.style.display = 'block';
     stale.innerHTML = '⚠️ Feed đứng yên ' + Math.round(age/60000) + ' phút — vòng lặp sinh board có thể đã dừng. ' +
       'Chạy lại: <code>while :; do bin/fm-token-board.sh &gt;/dev/null 2&gt;&gt;state/token-board.err; sleep ' +
