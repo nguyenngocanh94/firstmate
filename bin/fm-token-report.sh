@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
-# fm-token-report.sh - per-task token baseline report, computed from the ledger.
+# fm-token-report.sh - token baseline reports, computed from the ledger.
 #
 # Reads the per-call ledger produced by bin/fm-token-ledger.sh and writes ONE
-# JSON report per task. The report is the only thing a dashboard reads
+# JSON report. The report is the only thing a dashboard reads
 # (bin/fm-token-charts.sh renders from it), so every number in it must trace to
 # a ledger record. This script NEVER re-parses a session log itself: it either
 # takes a ledger on stdin / --ledger, or shells out to fm-token-ledger.sh and
 # consumes that output.
+#
+# Two report shapes, from the same ledger:
+#   default   fm-token-report.v1 - what one TASK cost: phases, tools, context
+#             anatomy, the delivered diff.
+#   --turns   fm-token-turn-report.v1 - what one SESSION cost PER TURN, and what
+#             opened each turn. This is the primary/secondmate ("mate") view:
+#             which turns were the captain, which were watcher wakes, which
+#             tasks those wakes were about, and how much each cost. It needs the
+#             ledger's turn_index and turn_trigger, which only the claude parser
+#             supplies today; a record without them lands in an explicit unknown
+#             turn rather than being folded into a neighbouring one.
 #
 # WHERE THE REPORT GOES - deliberate deviation from the original spec:
 # reports are written to the operational home's PRIVATE, gitignored
@@ -35,6 +46,8 @@
 #   fm-token-report.sh --session <log> [--session <log>...] --task-label <name>
 #                      [--out <path>|--stdout]
 #   fm-token-report.sh --ledger <file>|- --task-label <name> [--out <path>|--stdout]
+#   fm-token-report.sh --turns --session <log> --task-label <name>
+#                      [--out <path>|--stdout]
 #   fm-token-report.sh -h|--help
 #
 #   --task <id>        firstmate task id; resolves its session logs and its
@@ -46,6 +59,9 @@
 #   --ledger <file>    read an existing ledger (JSONL) instead of running one;
 #                      "-" reads stdin
 #   --harness <h>      forced harness, passed through to the ledger
+#   --turns            produce the per-turn session report instead of the
+#                      per-task one; its default file name is
+#                      <report-id>.turns.json so the two never overwrite
 #   --out <path>       write here instead of the default private location
 #   --stdout           print the report instead of writing a file
 #
@@ -90,6 +106,7 @@ LEDGER=
 OUT=
 TO_STDOUT=0
 HARNESS=
+MODE=task
 SESSIONS=()
 
 while [ $# -gt 0 ]; do
@@ -106,6 +123,7 @@ while [ $# -gt 0 ]; do
     --harness=*) HARNESS=${1#--harness=} ;;
     --out) shift; [ $# -gt 0 ] || die "--out requires a path"; OUT=$1 ;;
     --out=*) OUT=${1#--out=} ;;
+    --turns) MODE=turns ;;
     --stdout) TO_STDOUT=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
@@ -214,7 +232,7 @@ DIFF_ADDED=unknown
 DIFF_REMOVED=unknown
 DIFF_BASIS=unknown
 
-if [ -n "$M_WORKTREE" ] && [ -d "$M_WORKTREE" ] && git -C "$M_WORKTREE" rev-parse --git-dir >/dev/null 2>&1; then
+if [ "$MODE" = task ] && [ -n "$M_WORKTREE" ] && [ -d "$M_WORKTREE" ] && git -C "$M_WORKTREE" rev-parse --git-dir >/dev/null 2>&1; then
   REPO_NAME=$(basename "$(git -C "$M_WORKTREE" rev-parse --show-toplevel 2>/dev/null || echo unknown)")
   HEAD_COMMIT=$(git -C "$M_WORKTREE" rev-parse HEAD 2>/dev/null || echo unknown)
   for base in origin/main origin/master main master; do
@@ -237,6 +255,167 @@ if [ -n "$M_WORKTREE" ] && [ -d "$M_WORKTREE" ] && git -C "$M_WORKTREE" rev-pars
 fi
 
 CAPS=$("$SCRIPT_DIR/fm-token-ledger.sh" --capabilities --json 2>/dev/null) || CAPS='{}'
+
+# --- shared jq preamble --------------------------------------------------------
+#
+# Spliced into BOTH report programs so the gross_tokens formula and the
+# unknown-poisoning sum have exactly one definition. gross_tokens is the one
+# place the two token families must not be confused: on an inclusive runtime
+# input already contains the cached read, so adding cached again would overstate
+# the call.
+JQ_REPORT_COMMON=$(cat <<'JQ'
+def num($x): if ($x | type) == "number" then $x else null end;
+def unk: if . == null then "unknown" else . end;
+def orunknown($s): if $s == "" or $s == null then "unknown" else $s end;
+def gross:
+  (num(.input_tokens)) as $i | (num(.output_tokens)) as $o
+  | (num(.cached_input_tokens)) as $c | (num(.cache_write_tokens)) as $w
+  | if $i == null or $o == null then null
+    elif (.token_semantics | test("_disjoint_buckets$"))
+      then ($i + $o + ($c // 0) + ($w // 0))
+    elif (.token_semantics | test("_input_includes_cached$"))
+      then ($i + $o)
+    else null end;
+# f is a FILTER, not a value: sum_or_unknown(.input_tokens) must evaluate
+# .input_tokens per record, so it must not be a $-bound parameter.
+def sum_or_unknown(f):
+  (map(f) | map(num(.))) as $v
+  | if ($v | any(. == null)) then "unknown" else ($v | add // 0) end;
+# sum_calls: model calls, unknown-poisoning like every other total here.
+def sum_calls: (map(num(.model_calls)) | if any(. == null) then "unknown" else (add // 0) end);
+JQ
+)
+
+# --- build the per-turn session report -----------------------------------------
+#
+# Same input, same rule: arithmetic over ledger records only. Turn attribution
+# comes from the ledger's turn_index and turn_trigger; this layer classifies and
+# sums, and never re-reads a log or re-derives a boundary.
+#
+# Three rules keep the rollups honest, and each has an exact counterpart in
+# bin/fm-token-ledger.sh --turn-rules:
+#   * a turn is identified by (source_log, turn_index), never by turn_index
+#     alone, so turn 3 of one session is not merged with turn 3 of another;
+#   * a wake naming several tasks is ONE shared bucket keyed by all of its ids,
+#     and its tokens are never divided between them;
+#   * a call with no turn attribution keeps an explicit unknown turn and its own
+#     bucket instead of being folded into a neighbour.
+if [ "$MODE" = turns ]; then
+jq -s \
+  --arg report_id "$REPORT_ID" \
+  --arg task_id "${TASK:-unknown}" \
+  --arg label "${LABEL:-}" \
+  --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg m_harness "${M_HARNESS:-unknown}" \
+  --arg m_kind "${M_KIND:-unknown}" \
+  --argjson caps "$CAPS" "$JQ_REPORT_COMMON"'
+# The trigger accessors tolerate a record from a runtime that supplies no turn
+# fields at all: it reads as an unknown-triggered call, which is what it is.
+def tkind: (.turn_trigger.kind // "unknown");
+def wkind: (.turn_trigger.wake_kind // "none");
+def tids: (.turn_trigger.task_ids // []);
+def tbucket: (tids | if length == 0 then "unattributed" else (unique | join("+")) end);
+# trigger_class, rule 6 of --turn-rules. A wake payload carrying heartbeat
+# ALONE is the fleet-scan backstop and counts as overhead; a heartbeat arriving
+# with another verb is a real event and stays wake handling.
+def tclass:
+  tkind as $k
+  | if ($k == "captain" or $k == "launch-brief") then "captain-interaction"
+    elif $k == "wake" then (if wkind == "heartbeat" then "overhead" else "wake-handling" end)
+    elif $k == "task-notification" then "wake-handling"
+    else "overhead" end;
+def turn_key: [ (.source_log // "unknown"), (.turn_index | tostring) ];
+def rollup(kf):
+  group_by(kf)
+  | map({ key: (.[0] | kf),
+          turns: (map(turn_key) | unique | length),
+          calls: sum_calls,
+          marginal_tokens: sum_or_unknown(.uncached_input_tokens),
+          cache_read_tokens: sum_or_unknown(.cached_input_tokens),
+          output_tokens: sum_or_unknown(.output_tokens),
+          gross_tokens: sum_or_unknown(.gross_tokens) })
+  | sort_by(if (.gross_tokens | type) == "number" then -.gross_tokens else 0 end);
+
+. as $calls
+| ($calls | map(. + {gross_tokens: gross})) as $g
+| ($g | group_by(turn_key)
+      | map({ source_log: .[0].source_log,
+              turn_index: .[0].turn_index,
+              trigger_kind: (.[0] | tkind),
+              wake_kind: (.[0] | wkind),
+              task_ids: (.[0] | tids),
+              task_bucket: (.[0] | tbucket),
+              trigger_class: (.[0] | tclass),
+              trigger_detail: (.[0].turn_trigger.detail // "unknown"),
+              calls: sum_calls,
+              ledger_records: length,
+              naive_log_record_count: sum_or_unknown(.log_records),
+              sidechain_calls: (map(select(.is_sidechain == true)) | length),
+              marginal_tokens: sum_or_unknown(.uncached_input_tokens),
+              cache_read_tokens: sum_or_unknown(.cached_input_tokens),
+              output_tokens: sum_or_unknown(.output_tokens),
+              gross_tokens: sum_or_unknown(.gross_tokens),
+              started: (map(select(.timestamp != "unknown") | .timestamp) | sort | first // "unknown"),
+              finished: (map(select(.timestamp != "unknown") | .timestamp) | sort | last // "unknown") })
+      | sort_by([ (.source_log // "unknown"),
+                  (if (.turn_index | type) == "number" then 0 else 1 end),
+                  (if (.turn_index | type) == "number" then .turn_index else 0 end) ])) as $turns
+| { schema: "fm-token-turn-report.v1",
+    generated: $generated,
+    report_id: $report_id,
+
+    identity: {
+      task_id: (if $task_id == "unknown" and $label != "" then $label else $task_id end),
+      task_label: orunknown($label),
+      task_kind: $m_kind,
+      harness_recorded: $m_harness,
+      harness_observed: ($calls | map(.harness) | unique | join("+")),
+      sessions: ($calls | map(.session_id) | unique),
+      source_logs: ($calls | map(.source_log) | unique),
+      started: ($calls | map(select(.timestamp != "unknown") | .timestamp) | sort | first // "unknown"),
+      finished: ($calls | map(select(.timestamp != "unknown") | .timestamp) | sort | last // "unknown")
+    },
+
+    totals: {
+      turns: ($turns | length),
+      turns_with_unknown_index: ($turns | map(select((.turn_index | type) != "number")) | length),
+      calls: ($calls | sum_calls),
+      ledger_records: ($calls | length),
+      naive_log_record_count: ($calls | sum_or_unknown(.log_records)),
+      naive_log_record_note: "as the per-task report: calls counts distinct model calls, naive_log_record_count counts raw log records, and a per-record sum double-counts tokens. Both are reported so the difference stays provable.",
+      marginal_tokens: ($calls | sum_or_unknown(.uncached_input_tokens)),
+      marginal_tokens_note: "uncached input, derived per record token_semantics by the ledger (claude: input + cache_write). This is what a turn ADDED, as opposed to what it re-read from cache.",
+      cache_read_tokens: ($calls | sum_or_unknown(.cached_input_tokens)),
+      output_tokens: ($calls | sum_or_unknown(.output_tokens)),
+      gross_tokens: ($g | sum_or_unknown(.gross_tokens))
+    },
+
+    turns: $turns,
+
+    by_trigger_class: ($g | rollup(tclass)),
+    by_trigger_kind: ($g | rollup(tkind)),
+    by_wake_kind: ($g | map(select(tkind == "wake")) | rollup(wkind)),
+    by_task: ($g | rollup(tbucket)),
+    by_task_note: "a bucket key joins ALL task ids one wake named, so a multi-task wake is one shared bucket and its tokens are never split between tasks. \"unattributed\" is a MEASURED result: those turns name no task at all - a stale wake names a backend window, and a captain turn names nothing - and their cost is never redistributed onto a named task.",
+
+    turn_attribution: {
+      rules: "bin/fm-token-ledger.sh --turn-rules",
+      calls_without_turn: ($calls | map(select((.turn_index | type) != "number")) | length),
+      calls_without_turn_note: "calls the ledger could not place in a turn: a runtime that supplies no turn fields, or a log that begins mid-turn. They keep their own unknown bucket and are never folded into a neighbouring turn.",
+      runtimes_without_turn_fields: (
+        ($calls | map(select((.turn_index | type) != "number") | .harness) | unique) as $h
+        | ($caps.runtimes // {} | with_entries(select(.key as $k | $h | index($k)))
+           | with_entries({ key: .key, value: (.value.not_implemented // .value.cannot // {}) })))
+    },
+
+    capability_declaration: (
+      ($calls | map(.harness) | unique) as $used
+      | { runtimes_present: $used,
+          declaration: ($caps.runtimes // {} | with_entries(select(.key as $k | $used | index($k)))),
+          verified: ($caps.verified // "unknown") })
+  }
+' "$LEDGER_TMP" > "$LEDGER_TMP.out" || die "the per-turn report for $REPORT_ID could not be computed"
+else
 
 # --- build the report ---------------------------------------------------------
 #
@@ -263,28 +442,7 @@ jq -s \
   --arg diff_added "$DIFF_ADDED" \
   --arg diff_removed "$DIFF_REMOVED" \
   --arg diff_basis "$DIFF_BASIS" \
-  --argjson caps "$CAPS" '
-def num($x): if ($x | type) == "number" then $x else null end;
-def unk: if . == null then "unknown" else . end;
-def orunknown($s): if $s == "" or $s == null then "unknown" else $s end;
-# gross_tokens per the record OWN semantics. This is the one place the two
-# families must not be confused: on an inclusive runtime input already contains
-# the cached read, so adding cached again would overstate the call.
-def gross:
-  (num(.input_tokens)) as $i | (num(.output_tokens)) as $o
-  | (num(.cached_input_tokens)) as $c | (num(.cache_write_tokens)) as $w
-  | if $i == null or $o == null then null
-    elif (.token_semantics | test("_disjoint_buckets$"))
-      then ($i + $o + ($c // 0) + ($w // 0))
-    elif (.token_semantics | test("_input_includes_cached$"))
-      then ($i + $o)
-    else null end;
-# f is a FILTER, not a value: sum_or_unknown(.input_tokens) must evaluate
-# .input_tokens per record, so it must not be a $-bound parameter.
-def sum_or_unknown(f):
-  (map(f) | map(num(.))) as $v
-  | if ($v | any(. == null)) then "unknown" else ($v | add // 0) end;
-
+  --argjson caps "$CAPS" "$JQ_REPORT_COMMON"'
 . as $calls
 | ($calls | map(select((.context_size | type) == "number"))) as $ctxcalls
 | ($calls | map(. + {gross_tokens: gross})) as $g
@@ -361,9 +519,9 @@ def sum_or_unknown(f):
     token_semantics: ($calls | map(.token_semantics) | unique),
 
     totals: {
-      calls: ($calls | map(num(.model_calls)) | if any(. == null) then "unknown" else (add // 0) end),
+      calls: ($calls | sum_calls),
       ledger_records: ($calls | length),
-      naive_log_record_count: ($calls | map(num(.log_records)) | if any(. == null) then "unknown" else (add // 0) end),
+      naive_log_record_count: ($calls | sum_or_unknown(.log_records)),
       naive_log_record_note: "Claude writes one log record per content block of a single API response, each repeating the SAME usage. calls counts distinct model calls; a per-log-record sum double-counts tokens by roughly 2x. Both are reported so the difference is provable.",
       input_tokens: ($calls | sum_or_unknown(.input_tokens)),
       cached_input_tokens: ($calls | sum_or_unknown(.cached_input_tokens)),
@@ -482,6 +640,7 @@ def sum_or_unknown(f):
           verified: ($caps.verified // "unknown") })
   }
 ' "$LEDGER_TMP" > "$LEDGER_TMP.out" || die "the report for $REPORT_ID could not be computed"
+fi
 
 if [ "$TO_STDOUT" = 1 ]; then
   cat "$LEDGER_TMP.out"
@@ -489,7 +648,11 @@ if [ "$TO_STDOUT" = 1 ]; then
 fi
 
 if [ -z "$OUT" ]; then
-  OUT="$FM_DATA/token-reports/$REPORT_ID.json"
+  if [ "$MODE" = turns ]; then
+    OUT="$FM_DATA/token-reports/$REPORT_ID.turns.json"
+  else
+    OUT="$FM_DATA/token-reports/$REPORT_ID.json"
+  fi
 fi
 mkdir -p "$(dirname "$OUT")" || die "cannot create the report directory for $OUT"
 # Atomic publish: a killed run leaves the previous report intact, never a

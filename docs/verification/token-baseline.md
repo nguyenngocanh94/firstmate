@@ -1,10 +1,10 @@
 # Token baseline measurement verification
 
-Repeatable evidence for the per-call token ledger, the per-task report, and the per-runtime capability declaration.
+Repeatable evidence for the per-call token ledger, the per-task and per-turn reports, and the per-runtime capability declaration.
 Current behavior and the measurement rules are owned by [`../token-baseline.md`](../token-baseline.md); each tool's flags and mechanics by its own header and `--help`.
 This page records evidence only.
 
-Date: 2026-08-12.
+Date: 2026-08-12, except the per-turn attribution section, measured 2026-08-14 and dated there.
 Host: Darwin 25.5.0 (arm64), GNU bash 5.3.15, jq 1.7.1-apple, ShellCheck 0.11.0.
 Comparison base: `main` at `83f7549` (rebased onto it after PR 3 landed; originally measured against `735f8b9`, whose token figures below are unaffected because PR 3 changed attribution, not usage arithmetic).
 
@@ -108,6 +108,95 @@ The record supplies `modelCalls`, `apiDurationMs` and `costUsdTicks` but no cach
 
 **agy** - `~/.agy`, `~/.antigravity` and `~/.config/agy` are all absent on this host.
 Nothing can be measured, so agy is declared a blind spot.
+
+## Per-turn attribution on a claude primary session
+
+Date: 2026-08-14.
+Same host as above; jq 1.7.1-apple.
+
+The turn fields are established from the record shapes a real primary session actually contains, not from the shape a boundary was assumed to have.
+One reference primary session, read read-only:
+
+```console
+$ jq -r 'select(.type=="user")
+  | ((.isMeta//false)|tostring) + "\t" + ((.sourceToolUseID!=null)|tostring) + "\t"
+    + (if (.message.content|type)=="string" then "string"
+       else ([.message.content[].type]|unique|join("+")) end)' \
+  ~/.claude/projects/-Volumes-Work-AI-firstmate/08dc2684-d4da-49d7-a511-2aba1dd833f0.jsonl \
+  | sort | uniq -c
+   8 false	false	string
+  30 false	false	tool_result
+   2 true	false	string
+   2 true	true	text
+```
+
+Three facts from that distribution decide the boundary rule:
+
+- 30 of the 42 user records are tool-result carriers, so a rule that counted every user record would report roughly five times as many turns as the session had.
+- The two `isMeta` + `sourceToolUseID` records are skill bodies delivered by the model's own Skill tool call; they arrive mid-turn, so counting them would split one turn into several.
+- The two `isMeta` string records are local-command caveats, which likewise precede a command rather than opening a turn of their own.
+
+Across all 11 primary session logs in this home, `sourceToolUseID` was present on 110 records and every one of them also carried `isMeta: true`, and no user record anywhere carried a content array holding both `text` and `tool_result` blocks (21,624 `tool_result`, 165 `text`, 4 `image+text`).
+Both signals are therefore read independently rather than one standing in for the other, and `tests/fm-token-baseline.test.sh` drives them apart deliberately so neither can become silently load-bearing.
+
+The resulting turn table for that session:
+
+```console
+$ bin/fm-token-ledger.sh --session <the log above> --harness claude --json \
+  | jq -c 'group_by(.turn_index)[]
+    | {turn: .[0].turn_index, kind: .[0].turn_trigger.kind,
+       wake: .[0].turn_trigger.wake_kind, tasks: .[0].turn_trigger.task_ids, calls: length}'
+{"turn":4,"kind":"captain","wake":"none","tasks":[],"calls":7}
+{"turn":5,"kind":"wake","wake":"signal","tasks":["mexcmate","vaultmate"],"calls":5}
+{"turn":6,"kind":"captain","wake":"none","tasks":[],"calls":2}
+{"turn":7,"kind":"captain","wake":"none","tasks":[],"calls":5}
+{"turn":8,"kind":"captain","wake":"none","tasks":[],"calls":15}
+```
+
+Turns 1 to 3 were local commands that made no model call, which is why the ledger's first turn here is 4.
+The one wake in the session named two tasks and keeps both.
+
+Coverage across all 11 primary logs in this home, 4,477 model calls:
+
+```console
+$ for f in ~/.claude/projects/-Volumes-Work-AI-firstmate/*.jsonl; do
+    bin/fm-token-ledger.sh --session "$f" --harness claude --json 2>/dev/null; done \
+  | jq -s 'add | {calls: length,
+      kinds: ([.[].turn_trigger.kind]|group_by(.)|map({(.[0]):length})|add),
+      wake_kinds: ([.[]|select(.turn_trigger.kind=="wake")|.turn_trigger.wake_kind]
+                   |group_by(.)|map({(.[0]):length})|add),
+      unknown_turn: ([.[]|select((.turn_index|type)!="number")]|length)}'
+{"calls":4477,
+ "kinds":{"captain":2048,"local-command":65,"task-notification":315,"wake":2049},
+ "wake_kinds":{"away-supervisor":150,"check":211,"guard":99,"signal":845,"stale":744},
+ "unknown_turn":0}
+```
+
+No call fell outside a turn and no trigger classified as `unknown`, so every message shape these sessions contain is one the rules name.
+The `away-supervisor` bucket is the case that fixes the classifier ordering: firstmate types those escalations into the pane, so the runtime records them with `origin.kind` `human`, and only the operational marker distinguishes them from the captain.
+Reading origin first would have moved all 150 of those calls into captain interaction.
+
+Reconciliation on the reference session above, comparing the per-turn report against the ledger it was computed from:
+
+```console
+$ bin/fm-token-ledger.sh --session <the log above> --harness claude --json > /tmp/l.json
+$ jq -c '.[]' /tmp/l.json > /tmp/l.jsonl
+$ bin/fm-token-report.sh --turns --ledger /tmp/l.jsonl --task-label mate --stdout > /tmp/t.json
+$ jq -n --slurpfile l /tmp/l.json --slurpfile t /tmp/t.json '
+   ($l[0]) as $c | ($t[0]) as $r | def s(f): [$c[]|f]|add;
+   { exact_match: ( $r.totals.calls == ($c|length)
+     and $r.totals.marginal_tokens == s(.uncached_input_tokens)
+     and $r.totals.cache_read_tokens == s(.cached_input_tokens)
+     and $r.totals.output_tokens == s(.output_tokens)
+     and ([$r.turns[].marginal_tokens]|add) == s(.uncached_input_tokens)
+     and ([$r.by_trigger_class[].marginal_tokens]|add) == s(.uncached_input_tokens)
+     and ([$r.by_task[].marginal_tokens]|add) == s(.uncached_input_tokens)
+     and ([$r.turns[].naive_log_record_count]|add) == $r.totals.naive_log_record_count ) }'
+{"exact_match": true}
+```
+
+That comparison covers `totals.calls`, `marginal_tokens`, `cache_read_tokens`, `output_tokens`, the sum of the per-turn rows, and the sums of `by_trigger_class` and `by_task`; each partitions the same tokens exactly once.
+`tests/fm-token-baseline.test.sh` asserts the same identities on a synthesised fixture, so the reconciliation is enforced without depending on a private log.
 
 ## Compaction boundary shape
 
@@ -252,6 +341,14 @@ Exact totals are pinned only at the recorded assistant-record count.
 `tests/fm-token-baseline.test.sh` covers requestId grouping, the non-interchangeability of the Claude and Codex formulas in both directions, absent telemetry surfacing as `unknown` rather than 0, the context-composition identity plus a genuinely unattributable delta, the phase rules including `REWORK`'s exact-failure precondition and its refusal to fire on failure text alone, compaction parsed with exact magnitudes and zero events reported as measured, grok turn granularity, the private report location with its capability declaration, and the four chart renderings.
 Its reference cross-check self-skips when the captain's logs are absent, so the suite stays runnable on any host.
 It additionally covers pi and grok `--task` resolution against synthesized fixtures matching their documented cwd-encoding, codex `--task` resolution including the day-partition lookback bound, the three unmapped-runtime reasons being textually distinct, and the real codex cross-check described above.
+
+Turn attribution is covered by two further sections, both against synthesized fixtures.
+The first pins what opens a turn: a tool-result carrier does not, even when it also holds a text block; a tool-sourced skill body does not, whether or not it is marked meta; a local-command caveat does not; a sidechain prompt does not, while the subagent call it produced still lands in the turn that was open.
+It also pins that a wake keeps every task it named, that a stale wake naming only a backend window keeps an empty id list, that an away escalation carrying firstmate's operational marker is a wake rather than the captain despite its human origin, and that a log beginning mid-turn reports `unknown` rather than a guessed turn 1.
+The second pins the per-turn report: the per-turn rows, `by_trigger_class`, `by_trigger_kind` and `by_task` each partition the ledger's own token sums exactly once, a multi-task wake forms one shared bucket and never appears as a per-task one, turns naming no task land in `unattributed`, and a heartbeat-only wake counts as overhead while other wakes count as wake handling.
+Each of those boundary rules was mutation-checked by removing it from the ledger and confirming the suite fails, so none of them is a vacuous assertion.
+A third section covers the two shapes sharing one private directory: the chart renderer still produces a page, names the per-turn report it skipped, and refuses with a specific reason once no per-task report remains.
+Without the schema filter that case fails with `Cannot iterate over null`, which is what the mutation check confirms.
 
 `tests/fm-teardown.test.sh` gains five token-report cases.
 Three are fail-open cases: a reporter that genuinely fails (an empty session-log root, so the ledger cannot resolve a log), one that is genuinely still working when the bound fires (a rollout whose first line is 200MB), and one where a codex task's session genuinely cannot be mapped (an empty codex session root).

@@ -10,7 +10,7 @@ The three tools form one chain, and each layer reads only the layer below it:
 | Tool | Reads | Writes |
 | --- | --- | --- |
 | [`bin/fm-token-ledger.sh`](../bin/fm-token-ledger.sh) | a raw agent session log | one JSON record per model call, on stdout |
-| [`bin/fm-token-report.sh`](../bin/fm-token-report.sh) | a ledger | one report at `data/token-reports/<task-id>.json` |
+| [`bin/fm-token-report.sh`](../bin/fm-token-report.sh) | a ledger | one report at `data/token-reports/<task-id>.json`, or the per-turn session report at `<task-id>.turns.json` with `--turns` |
 | [`bin/fm-token-charts.sh`](../bin/fm-token-charts.sh) | reports | one self-contained HTML page |
 
 A report is never computed by re-parsing a log, and a chart is never drawn from anything but a report.
@@ -137,7 +137,38 @@ An absent error flag never raises it, so on runtimes with no error flag `REWORK`
 `supervision_calls` and `supervision_tokens` are measured **within one session only**.
 Inside a single worker session there is little supervision; the fleet's real orchestration cost sits in whole primary and secondmate sessions, which a per-task report does not and cannot see.
 Every report carries that boundary as `supervision_boundary`.
-A fleet-level rollup is separate work.
+
+The orchestration side of that boundary is measured separately, per turn, by the surface below.
+A fleet-level rollup across sessions is still separate work.
+
+## Per-turn attribution: what a primary or secondmate session spent, and on what
+
+A per-task report answers "what did this task cost".
+`fm-token-report.sh --turns` answers the other half: what one primary or secondmate ("mate") session cost **per turn**, and what opened each turn.
+That is what separates the captain's own interaction from watcher wake handling, and names the tasks each wake was about.
+
+It rests on two ledger fields, `turn_index` and `turn_trigger`, and adds no new source of truth: the ledger reads them from the session log, and the report only classifies and sums.
+
+- `turn_index` counts turn boundaries within one source log, from 1.
+  A call that no boundary precedes is `unknown`, never folded into a turn 1 that was not observed, because a resumed or compacted log can genuinely begin mid-turn.
+- `turn_trigger` records what opened the turn: the captain, a launch brief, a watcher wake, a background task notification, a local command, session start, or `unknown` with a bounded snippet.
+  A wake also carries a `wake_kind` - its reason verbs (`signal`, `stale`, `check`, `heartbeat`, joined with `+` when one payload carries several), or when no verb is present the guard sentence or operational kind that established it - and every task id the payload named.
+
+`fm-token-ledger.sh --turn-rules` prints the exact boundary and classification rules and is their single owner, so they cannot drift from this description.
+Three of those rules carry the measurement contract into this surface.
+
+- A wake naming several tasks is **one shared bucket** keyed by all of its ids, and its tokens are never divided between them.
+- A turn naming no task at all - a stale wake names a backend window, and a captain turn names nothing - lands in an explicit `unattributed` bucket that is never redistributed onto a named task.
+- A message the runtime recorded as typed by a person is the captain, except when it carries firstmate's own operational marker; firstmate types its injections into the pane, so the marker is the only evidence that separates them.
+
+Per turn the report gives model calls, marginal tokens (the uncached input a turn actually added), cache read, output and gross tokens, alongside `calls` and `naive_log_record_count` exactly as the per-task report does.
+It then rolls those up per trigger kind, per wake kind, per task bucket, and per trigger class - captain interaction, wake handling, and overhead.
+
+Both report shapes land in the same private directory, and [`bin/fm-token-charts.sh`](../bin/fm-token-charts.sh) renders the per-task shape only.
+It admits a file by the schema the file declares and names any report it skips on stderr, so a report that was written but not drawn is never mistaken for one that was.
+
+Turn segmentation is implemented for claude only.
+The other runtimes declare `turn_index` and `turn_trigger` under `not_implemented` in `--capabilities`, which is a distinct claim from `cannot`: `cannot` is a limit of the runtime's log, `not_implemented` is a gap in this tool, and guessing at another runtime's turn shape would fabricate attribution.
 
 ## Two different line counts, never conflated
 
@@ -186,5 +217,5 @@ Old daily snapshots are never rewritten automatically; do not compare them again
 
 Keep this page to current behavior, the measurement rules, and the stated limits.
 Exact flags, commands and paths belong in each script's header and `--help`.
-The phase rules belong to `fm-token-ledger.sh --phase-rules`, and the per-runtime capability facts to `--capabilities`; describe them here, but do not restate them in full.
+The phase rules belong to `fm-token-ledger.sh --phase-rules`, the turn rules to `--turn-rules`, and the per-runtime capability facts to `--capabilities`; describe them here, but do not restate them in full.
 Dated evidence belongs in [`verification/token-baseline.md`](verification/token-baseline.md).

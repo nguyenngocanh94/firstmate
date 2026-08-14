@@ -68,6 +68,19 @@ claude_tool_result() {
     }' >> "$1"
 }
 
+# claude_user <file> <uuid> <text> [extra-fields-json]
+# One user LOG RECORD carrying text. The extra object is merged last, so a case
+# can add exactly the field it is about (isMeta, sourceToolUseID, isSidechain,
+# origin) or replace message entirely with a content-array form.
+claude_user() {
+  mkdir -p "$(dirname "$1")"
+  jq -cn --arg uuid "$2" --arg text "$3" --argjson extra "${4:-{\}}" '{
+      type: "user", timestamp: "2026-08-12T06:00:00.000Z", uuid: $uuid,
+      sessionId: "sess-fixture", isSidechain: false,
+      message: { role: "user", content: $text }
+    } + $extra' >> "$1"
+}
+
 tool_use() {  # <name> <input-json> -> one content array
   jq -cn --arg n "$1" --argjson i "${2:-{\}}" '[ { type: "tool_use", name: $n, input: $i } ]'
 }
@@ -952,5 +965,239 @@ if [ -n "${REAL_CODEX_LOG:-}" ] && [ -f "$REAL_CODEX_LOG" ]; then
 else
   echo "skip: no real codex session log with a session_meta.cwd found in the last $REAL_LOOKBACK day-partitions on this host"
 fi
+
+# --- 14. per-turn attribution on a primary ("mate") session -------------------
+#
+# The question this answers is "is the mate burning tokens, is it being spammed
+# with wakes, and by what" - so the contracts under test are: what opens a turn,
+# what a turn was triggered by, and that a wake naming several tasks is one
+# SHARED bucket rather than tokens divided between them.
+
+TURN_LOG="$TMP_ROOT/turns/session.jsonl"
+# Turn 1: a local command. The caveat that precedes it is a meta injection and
+# must NOT open a turn of its own.
+claude_user "$TURN_LOG" tu-caveat '<local-command-caveat>Caveat: generated while running local commands.</local-command-caveat>' '{"isMeta":true}'
+claude_user "$TURN_LOG" tu-cmd '<command-name>/model</command-name>'
+# Turn 2: the captain types. One API response written as THREE records (the
+# requestId grouping contract), then a tool result carrier - which continues the
+# turn - and a second call.
+claude_user "$TURN_LOG" tu-cap 'measure the mate please' '{"origin":{"kind":"human"},"promptSource":"typed"}'
+claude_call "$TURN_LOG" tr1 tv1 ""    10 100 1000 50 20 '[{"type":"thinking"}]'
+claude_call "$TURN_LOG" tr1 tv2 tv1   10 100 1000 50 20 '[{"type":"text"}]'
+claude_call "$TURN_LOG" tr1 tv3 tv2   10 100 1000 50 20 "$(tool_use Bash '{"command":"ls"}')"
+claude_tool_result "$TURN_LOG" tv3 '{"stdout":"ok"}' false
+# A carrier that also holds a text block: the tool_result is what makes it a
+# continuation, so the text must not promote it to a boundary.
+claude_user "$TURN_LOG" tu-mixed '' \
+  '{"message":{"role":"user","content":[{"type":"text","text":"and here is the output"},{"type":"tool_result","is_error":false}]}}'
+claude_call "$TURN_LOG" tr2 tv4 tv3    5  20 1200 30 10 '[{"type":"text"}]'
+# Turn 3: a watcher wake naming TWO tasks. A skill body arrives mid-turn as a
+# tool-sourced injection and must not split the turn.
+claude_user "$TURN_LOG" tu-wake '<task-notification>
+<summary>Stop hook feedback</summary>
+</task-notification>
+firstmate watcher wake - one supervision event needs a handling turn now.
+signal: /home/x/state/alpha-task.status /home/x/state/beta-task.status /home/x/state/beta-task.turn-ended' '{"origin":{"kind":"task-notification"},"promptSource":"system"}'
+claude_call "$TURN_LOG" tr3 tv5 tv4    7  30 1300 40 0 "$(tool_use Read '{"file_path":"a"}')"
+claude_user "$TURN_LOG" tu-skill 'Base directory for this skill: /x/.claude/skills/harness-adapters' '{"isMeta":true,"sourceToolUseID":"tu-1"}'
+# The same injection with the two signals driven APART: tool-sourced but not
+# marked meta. Every such record observed today carries both, so this pins that
+# either signal alone is enough and neither is silently load-bearing.
+claude_user "$TURN_LOG" tu-skill2 'Base directory for this skill: /x/.claude/skills/stow' '{"sourceToolUseID":"tu-2"}'
+claude_call "$TURN_LOG" tr4 tv6 tv5    8  40 1400 45 0 '[{"type":"text"}]'
+# Turn 4: a stale wake. It names a backend window, which is NOT a task id.
+claude_user "$TURN_LOG" tu-stale 'firstmate watcher wake - one supervision event needs a handling turn now.
+stale: default:w7:p2 (idle 900s, possible wedge, escalation 1)' '{"origin":{"kind":"task-notification"}}'
+claude_call "$TURN_LOG" tr5 tv7 tv6    3  10 1500 20 0 '[{"type":"text"}]'
+# Turn 5: a heartbeat backstop, plus a subagent prompt and its call. The
+# sidechain prompt must not open a turn, and its call belongs to turn 5.
+claude_user "$TURN_LOG" tu-hb 'firstmate watcher wake - one supervision event needs a handling turn now.
+heartbeat' '{"origin":{"kind":"task-notification"}}'
+claude_call "$TURN_LOG" tr6 tv8 tv7     2   5 1600 15 0 '[{"type":"text"}]'
+claude_user "$TURN_LOG" tu-sub 'subagent brief' '{"isSidechain":true}'
+jq -cn '{type:"assistant", timestamp:"2026-08-12T06:00:00.000Z", uuid:"tv9",
+  parentUuid:"tv8", requestId:"tr7", sessionId:"sess-fixture", isSidechain:true,
+  effort:"high", message:{model:"claude-opus-5", content:[{type:"text"}],
+    usage:{input_tokens:1, cache_creation_input_tokens:5,
+           cache_read_input_tokens:1700, output_tokens:10,
+           output_tokens_details:{thinking_tokens:0}, iterations:[{type:"message"}]}}}' >> "$TURN_LOG"
+
+# Turn 6: an away-mode escalation. Firstmate types its injections into the pane,
+# so the runtime records them as human origin; the operational marker is what
+# proves otherwise, and it names its task as a bare file name, not a path.
+AWAY_MSG=$(printf 'Supervisor escalate (1 event(s)): gamma-task.status: blocked: needs a credential' \
+  | "$ROOT/bin/fm-operational-input.sh" encode away-supervisor) \
+  || fail "could not build an operational away-supervisor input"
+claude_user "$TURN_LOG" tu-away "$AWAY_MSG" '{"origin":{"kind":"human"},"promptSource":"typed"}'
+claude_call "$TURN_LOG" tr8 tva tv9     2   5 1800 12 0 '[{"type":"text"}]'
+
+TJ=$("$LEDGER" --session "$TURN_LOG" --harness claude --json 2>/dev/null) \
+  || fail "turn segmentation: ledger failed"
+turn_of() {  # <request_id>
+  printf '%s' "$TJ" | jq -r --arg r "$1" '.[] | select(.request_id == $r) | .turn_index | tostring'
+}
+trigger_of() {  # <request_id> <jq-path>
+  printf '%s' "$TJ" | jq -r --arg r "$1" ".[] | select(.request_id == \$r) | .turn_trigger$2"
+}
+
+[ "$(printf '%s' "$TJ" | jq 'length')" = 8 ] \
+  || fail "turn fixture: want 8 model calls, got $(printf '%s' "$TJ" | jq 'length')"
+[ "$(turn_of tr1)" = 2 ] \
+  || fail "the captain turn must be turn 2 (the caveat is an injection, the local command is turn 1), got $(turn_of tr1)"
+[ "$(turn_of tr2)" = 2 ] \
+  || fail "a tool_result carrier must NOT open a turn, even when it also carries text: tr2 must stay in turn 2, got $(turn_of tr2)"
+[ "$(trigger_of tr1 .kind)" = captain ] || fail "a typed human message must classify as captain"
+[ "$(trigger_of tr1 .wake_kind)" = none ] \
+  || fail "a captain turn must report wake_kind \"none\" (proven absent), got $(trigger_of tr1 .wake_kind)"
+[ "$(trigger_of tr1 .detail)" = none ] \
+  || fail "a captain turn must not store a snippet of the captain's own message"
+
+[ "$(turn_of tr3)" = 3 ] || fail "the wake must open turn 3, got $(turn_of tr3)"
+[ "$(turn_of tr4)" = 3 ] \
+  || fail "a tool-sourced skill injection must not split a turn, whether it is marked meta or not: tr4 must stay in turn 3, got $(turn_of tr4)"
+[ "$(trigger_of tr3 .kind)" = wake ] \
+  || fail "a Stop-hook watcher wake wrapped in a task-notification must classify as wake, not task-notification"
+[ "$(trigger_of tr3 .wake_kind)" = signal ] || fail "the wake verb must be read as signal"
+[ "$(trigger_of tr3 '.task_ids | join(",")')" = "alpha-task,beta-task" ] \
+  || fail "a multi-task wake must keep ALL its task ids, got $(trigger_of tr3 '.task_ids | join(",")')"
+
+[ "$(turn_of tr5)" = 4 ] || fail "the stale wake must open turn 4, got $(turn_of tr5)"
+[ "$(trigger_of tr5 .wake_kind)" = stale ] || fail "the stale wake verb must be read as stale"
+[ "$(trigger_of tr5 '.task_ids | length')" = 0 ] \
+  || fail "a stale wake names a backend window, not a task: its task_ids must stay empty rather than guess"
+
+[ "$(turn_of tr6)" = 5 ] || fail "the heartbeat wake must open turn 5, got $(turn_of tr6)"
+[ "$(trigger_of tr6 .wake_kind)" = heartbeat ] || fail "the heartbeat wake verb must be read as heartbeat"
+[ "$(turn_of tr7)" = 5 ] \
+  || fail "a sidechain prompt must not open a turn: the subagent call stays in turn 5, got $(turn_of tr7)"
+[ "$(printf '%s' "$TJ" | jq -r '.[] | select(.request_id == "tr7") | .is_sidechain')" = true ] \
+  || fail "the subagent call must still be marked is_sidechain so a consumer can split it out"
+
+[ "$(turn_of tr8)" = 6 ] || fail "the away escalation must open turn 6, got $(turn_of tr8)"
+[ "$(trigger_of tr8 .kind)" = wake ] \
+  || fail "an operational marker must outrank human origin: a firstmate injection typed into the pane is not the captain, got $(trigger_of tr8 .kind)"
+[ "$(trigger_of tr8 .wake_kind)" = away-supervisor ] \
+  || fail "a wake with no reason verb must report the operational kind that established it, got $(trigger_of tr8 .wake_kind)"
+[ "$(trigger_of tr8 '.task_ids | join(",")')" = gamma-task ] \
+  || fail "a task named as a bare file name must still be extracted, got $(trigger_of tr8 '.task_ids | join(",")')"
+pass "turn boundaries follow user messages only, and every wake keeps all of the tasks it named"
+
+# A log that begins mid-turn: the calls before any boundary are "unknown", never
+# folded into a turn 1 that was never observed.
+NOTURN="$TMP_ROOT/turns/noturn.jsonl"
+claude_call "$NOTURN" nr1 nv1 "" 10 100 1000 50 0 '[{"type":"text"}]'
+claude_user "$NOTURN" nu1 'now a real turn' '{"origin":{"kind":"human"}}'
+claude_call "$NOTURN" nr2 nv2 nv1 10 100 1100 50 0 '[{"type":"text"}]'
+NJ=$("$LEDGER" --session "$NOTURN" --harness claude --json 2>/dev/null)
+[ "$(printf '%s' "$NJ" | jq -r '.[0].turn_index')" = unknown ] \
+  || fail "a call with no preceding boundary must be turn_index \"unknown\", got $(printf '%s' "$NJ" | jq -r '.[0].turn_index')"
+[ "$(printf '%s' "$NJ" | jq -r '.[0].turn_trigger.kind')" = unknown ] \
+  || fail "a call with no preceding boundary must have an unknown trigger kind"
+[ "$(printf '%s' "$NJ" | jq -r '.[0].turn_trigger.detail')" != none ] \
+  || fail "the unknown trigger must say WHY it is unknown"
+[ "$(printf '%s' "$NJ" | jq -r '.[1].turn_index')" = 1 ] \
+  || fail "the first observed boundary must be turn 1, got $(printf '%s' "$NJ" | jq -r '.[1].turn_index')"
+pass "a log that begins mid-turn reports \"unknown\", never a guessed turn 1"
+
+# --- 15. the per-turn report: exact rollups, shared buckets, no splitting ------
+
+TR=$("$REPORT" --turns --session "$TURN_LOG" --harness claude --task-label mate-session --stdout 2>/dev/null) \
+  || fail "the per-turn report failed"
+[ "$(printf '%s' "$TR" | jq -r .schema)" = fm-token-turn-report.v1 ] \
+  || fail "the per-turn report must declare its own schema"
+[ "$(printf '%s' "$TR" | jq '.totals.turns')" = 5 ] \
+  || fail "only turns that made model calls appear in the ledger: want 5, got $(printf '%s' "$TR" | jq '.totals.turns')"
+[ "$(printf '%s' "$TR" | jq '.totals.calls')" = 8 ] \
+  || fail "the report must count MODEL CALLS, got $(printf '%s' "$TR" | jq '.totals.calls')"
+[ "$(printf '%s' "$TR" | jq '.totals.naive_log_record_count')" = 10 ] \
+  || fail "naive_log_record_count must stay visible beside calls, got $(printf '%s' "$TR" | jq '.totals.naive_log_record_count')"
+
+# Every rollup must reconcile EXACTLY with the ledger's own deduped totals.
+LEDGER_MARGINAL=$(printf '%s' "$TJ" | jq '[.[].uncached_input_tokens] | add')
+LEDGER_CR=$(printf '%s' "$TJ" | jq '[.[].cached_input_tokens] | add')
+LEDGER_OUT=$(printf '%s' "$TJ" | jq '[.[].output_tokens] | add')
+[ "$(printf '%s' "$TR" | jq '.totals.marginal_tokens')" = "$LEDGER_MARGINAL" ] \
+  || fail "report marginal tokens must equal the ledger's uncached input sum ($LEDGER_MARGINAL)"
+[ "$(printf '%s' "$TR" | jq '.totals.cache_read_tokens')" = "$LEDGER_CR" ] \
+  || fail "report cache read must equal the ledger's cached input sum ($LEDGER_CR)"
+[ "$(printf '%s' "$TR" | jq '.totals.output_tokens')" = "$LEDGER_OUT" ] \
+  || fail "report output must equal the ledger's output sum ($LEDGER_OUT)"
+for section in turns by_trigger_class by_task by_trigger_kind; do
+  got=$(printf '%s' "$TR" | jq --arg s "$section" '[ .[$s][].marginal_tokens ] | add')
+  [ "$got" = "$LEDGER_MARGINAL" ] \
+    || fail "$section must partition the same tokens exactly once: want $LEDGER_MARGINAL, got $got"
+done
+
+# The multi-task wake is ONE shared bucket, and no single task carries its cost.
+SHARED=$(printf '%s' "$TR" | jq -r '.by_task[] | select(.key | test("\\+")) | .key')
+[ "$SHARED" = "alpha-task+beta-task" ] \
+  || fail "a multi-task wake must form one shared bucket keyed by all its ids, got '$SHARED'"
+[ "$(printf '%s' "$TR" | jq '[ .by_task[] | select(.key == "alpha-task") ] | length')" = 0 ] \
+  || fail "a multi-task wake must NEVER be split into per-task buckets"
+[ "$(printf '%s' "$TR" | jq '[ .by_task[] | select(.key == "unattributed") ] | length')" = 1 ] \
+  || fail "turns naming no task must land in an explicit unattributed bucket"
+
+# Trigger classes: the captain, wake handling, and overhead are exclusive, and a
+# heartbeat-only wake counts as overhead per --turn-rules.
+class_of() {  # <turn_index>
+  printf '%s' "$TR" | jq -r --argjson t "$1" '.turns[] | select(.turn_index == $t) | .trigger_class'
+}
+[ "$(class_of 2)" = captain-interaction ] || fail "the captain turn must be captain-interaction"
+[ "$(class_of 3)" = wake-handling ] || fail "a signal wake turn must be wake-handling"
+[ "$(class_of 4)" = wake-handling ] || fail "a stale wake turn must be wake-handling"
+[ "$(class_of 5)" = overhead ] || fail "a heartbeat-only wake is the fleet-scan backstop and counts as overhead"
+[ "$(class_of 6)" = wake-handling ] || fail "an away escalation is wake handling, not captain interaction"
+WK=$(printf '%s' "$TR" | jq -r '[ .by_wake_kind[].key ] | sort | join(",")')
+[ "$WK" = "away-supervisor,heartbeat,signal,stale" ] \
+  || fail "by_wake_kind must cover every wake verb observed, got '$WK'"
+[ "$(printf '%s' "$TR" | jq -r '.turn_attribution.rules')" = "bin/fm-token-ledger.sh --turn-rules" ] \
+  || fail "the report must point at the single owner of the turn rules"
+pass "the per-turn report reconciles exactly with the ledger and never splits a shared wake"
+
+# Turn fields are declared honestly per runtime: claude supplies them, and the
+# runtimes this ledger does not segment say so as NOT IMPLEMENTED rather than
+# blaming the runtime for a gap in the tool.
+CAPS_ALL=$("$LEDGER" --capabilities --json 2>/dev/null)
+[ "$(printf '%s' "$CAPS_ALL" | jq '.runtimes.claude.supplies | index("turn_index") != null')" = true ] \
+  || fail "claude must declare that it supplies turn_index"
+[ "$(printf '%s' "$CAPS_ALL" | jq '.runtimes.claude.supplies | index("turn_trigger") != null')" = true ] \
+  || fail "claude must declare that it supplies turn_trigger"
+for rt in pi codex grok; do
+  for field in turn_index turn_trigger; do
+    [ "$(printf '%s' "$CAPS_ALL" | jq -r --arg r "$rt" --arg f "$field" '.runtimes[$r].not_implemented[$f] // "MISSING"')" != MISSING ] \
+      || fail "$rt must declare $field as not implemented, with a reason"
+    [ "$(printf '%s' "$CAPS_ALL" | jq -r --arg r "$rt" --arg f "$field" '.runtimes[$r].cannot[$f] // "absent"')" = absent ] \
+      || fail "$rt must not claim $field is a limit of the RUNTIME; it is a gap in this ledger"
+  done
+done
+"$LEDGER" --turn-rules 2>/dev/null | grep -q 'turn_index counts turn boundaries' \
+  || fail "--turn-rules must print the rules it owns"
+pass "turn fields are declared per runtime, and the rules have a single printed owner"
+
+# Both report shapes share one private directory, so the chart renderer must
+# take the per-task one and say so when it leaves the other behind.
+MIX_HOME="$TMP_ROOT/mixed"
+mkdir -p "$MIX_HOME/state" "$MIX_HOME/data"
+mix_report() {  # <extra-report-flags...>
+  FM_HOME="$MIX_HOME" FM_STATE_OVERRIDE="$MIX_HOME/state" FM_DATA_OVERRIDE="$MIX_HOME/data" \
+    "$REPORT" "$@" --session "$TURN_LOG" --harness claude --task-label mate-mixed >/dev/null 2>&1
+}
+mix_report || fail "the per-task report for the mixed directory failed"
+mix_report --turns || fail "the per-turn report for the mixed directory failed"
+assert_present "$MIX_HOME/data/token-reports/mate-mixed.turns.json" "per-turn report file"
+CH_ERR="$TMP_ROOT/mixed-charts-err.txt"
+CH_OUT=$(FM_HOME="$MIX_HOME" FM_DATA_OVERRIDE="$MIX_HOME/data" "$CHARTS" 2>"$CH_ERR") \
+  || fail "charts must still render when a per-turn report shares the directory: $(cat "$CH_ERR")"
+assert_present "$CH_OUT" "charts page rendered beside a per-turn report"
+grep -qF 'mate-mixed.turns.json' "$CH_ERR" \
+  || fail "a skipped report must be named on stderr, never dropped silently"
+# With only the unrenderable shape present, the refusal must name the cause.
+rm -f "$MIX_HOME/data/token-reports/mate-mixed.json" "$CH_OUT"
+if FM_HOME="$MIX_HOME" FM_DATA_OVERRIDE="$MIX_HOME/data" "$CHARTS" >/dev/null 2>"$CH_ERR"; then
+  fail "charts must refuse when no per-task report remains, rather than rendering an empty page"
+fi
+grep -q 'no per-task reports to render' "$CH_ERR" \
+  || fail "the refusal must say what was missing, got: $(cat "$CH_ERR")"
+pass "charts render the per-task shape only, and name every report they leave behind"
 
 printf 'ok - all fm-token-baseline behavior tests passed\n'
