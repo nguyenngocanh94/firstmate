@@ -165,7 +165,7 @@ Three of those rules carry the measurement contract into this surface.
 Per turn the report gives model calls, marginal tokens (the uncached input a turn actually added), cache read, output and gross tokens, alongside `calls` and `naive_log_record_count` exactly as the per-task report does.
 It then rolls those up per trigger kind, per wake kind, per task bucket, and per trigger class - captain interaction, wake handling, and overhead.
 
-Both report shapes land in the same private directory, and [`bin/fm-token-charts.sh`](../bin/fm-token-charts.sh) draws each of them by the schema the file declares: the four charts above for a per-task report, and the per-turn view - marginal share by trigger class, marginal per turn with its trigger label, and the wake-kind and task-bucket rollups - for a turn report.
+Both report shapes land in the same private directory, and [`bin/fm-token-charts.sh`](../bin/fm-token-charts.sh) draws each of them by the schema the file declares: the four baseline charts its header enumerates for a per-task report, and the per-turn view - marginal share by trigger class, marginal per turn with its trigger label, and the wake-kind and task-bucket rollups - for a turn report.
 It admits a file only when it recognises that schema and names any report it skips on stderr, so a report that was written but not drawn is never mistaken for one that was.
 
 Turn segmentation is implemented for claude only.
