@@ -44,6 +44,17 @@
 # model_calls is the exact number of model calls a record accounts for. It is
 # read from the log, never inferred.
 #
+# turn_index and turn_trigger (claude only) answer a different question from
+# granularity: WHICH conversation turn a call belongs to, and WHAT opened that
+# turn. On a primary or secondmate session that is what separates the captain's
+# own interaction from watcher wake handling, and names the tasks a wake was
+# about. Both are per SOURCE LOG, counted from that log's first turn boundary;
+# a call that no boundary precedes carries "unknown", never turn 1 by default.
+# Run `fm-token-ledger.sh --turn-rules` for the exact boundary and
+# classification rules - that command is their single owner. Non-claude
+# runtimes declare these two fields as not implemented in --capabilities
+# rather than guessing at another runtime's turn shape.
+#
 # Supported harnesses and their log locations:
 #   claude  ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
 #   pi      ~/.pi/agent/sessions/<encoded-cwd>/<ts>_<id>.jsonl
@@ -61,6 +72,7 @@
 #   fm-token-ledger.sh --task <id> [--json]
 #   fm-token-ledger.sh --capabilities [--json]
 #   fm-token-ledger.sh --phase-rules
+#   fm-token-ledger.sh --turn-rules
 #   fm-token-ledger.sh -h|--help
 #
 #   --session <log>  a session log path (repeatable). The harness is detected
@@ -77,6 +89,7 @@
 #   --json           print a JSON array instead of JSONL
 #   --capabilities   print the per-runtime capability declaration and exit
 #   --phase-rules    print the exact phase-classification rules and exit
+#   --turn-rules     print the exact turn-boundary and turn-trigger rules and exit
 #
 # Diagnostics go to stderr prefixed "fm-token-ledger:". A LOUD diagnostic plus
 # "unknown" is always preferred over a silently summed or invented number - in
@@ -139,6 +152,14 @@ CODEX_SESSIONS="${FM_CODEX_SESSIONS:-$HOME/.codex/sessions}"
 # shellcheck source=bin/fm-token-dedup-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-token-dedup-lib.sh"
+# The operational-input wire forms (current typed prefix and the legacy
+# payloads still present in persisted transcripts) are owned by this library.
+# The turn classifier reads them from it rather than restating their bytes, so
+# a wire-form change reaches this ledger the same way it reaches every other
+# reader.
+# shellcheck source=bin/fm-operational-input.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-operational-input.sh"
 
 warn() { printf 'fm-token-ledger: %s\n' "$*" >&2; }
 die() { warn "$*"; exit 2; }
@@ -164,6 +185,7 @@ while [ $# -gt 0 ]; do
     --json) FORMAT=json ;;
     --capabilities) MODE=capabilities ;;
     --phase-rules) MODE=phase-rules ;;
+    --turn-rules) MODE=turn-rules ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
@@ -179,6 +201,12 @@ command -v jq >/dev/null 2>&1 || die "jq not found"
 # whether a missing value means "zero" or "this runtime cannot tell us".
 # Every "cannot" below is a probe result recorded in
 # docs/verification/token-baseline.md, not an assumption.
+#
+# "cannot" and "not_implemented" are DIFFERENT claims and are kept apart:
+# "cannot" is a limit of the runtime's own log, while "not_implemented" is a
+# field this ledger does not emit for that runtime because its shape has not
+# been verified against a real session of it. Collapsing them would blame a
+# runtime for a gap in this tool.
 fm_ledger_capabilities() {
   jq -n '{
     schema: "fm-token-capabilities.v1",
@@ -193,12 +221,14 @@ fm_ledger_capabilities() {
                    "context_size","context_delta","model","effort","timestamp",
                    "tool_name","tool_input_digest","tool_result_bytes",
                    "prev_call_uuid","is_sidechain","compaction_event",
-                   "truncation_event","error_result","edit_lines"],
+                   "truncation_event","error_result","edit_lines",
+                   "turn_index","turn_trigger"],
         cannot: {
           duration_ms: "no per-call duration field; system/turn_duration records cover a whole turn (many calls), so a per-call value would be invented",
           cost_usd: "no cost field; bin/fm-token-usage.sh owns API-equivalent pricing separately and this ledger does not price",
           static_floor_component_split: "the log records the first call total only, never a per-component token split of it"
-        }
+        },
+        notes: "turn_index and turn_trigger were verified on 2026-08-14 against a real primary session carrying watcher wakes, local-command artifacts and skill injections; see --turn-rules for the rules and docs/verification/token-baseline.md for the evidence."
       },
       pi: {
         log: "~/.pi/agent/sessions/<encoded-cwd>/<ts>_<id>.jsonl",
@@ -214,6 +244,10 @@ fm_ledger_capabilities() {
           duration_ms: "no per-call duration field",
           compaction_event: "no compaction boundary record observed; reductions are reported as measured unexplained context drops instead",
           edit_lines: "tool results carry content, not a structured patch, so edit churn cannot be counted without parsing tool output as a diff"
+        },
+        not_implemented: {
+          turn_index: "the pi turn-boundary record shape has not been verified against a real pi primary session, and a guessed boundary would fabricate per-turn attribution",
+          turn_trigger: "the wake and captain message shapes a pi primary session records have not been probed, so no classification is claimed"
         },
         notes: "pi is the only runtime that supplies cost in USD already computed (usage.cost.total)."
       },
@@ -233,6 +267,10 @@ fm_ledger_capabilities() {
           compaction_metrics: "the context_compacted payload carries no pre/post token counts, so the event is recorded with unknown magnitude",
           edit_lines: "patch_apply_end records do not carry per-line counts"
         },
+        not_implemented: {
+          turn_index: "codex records user_message payloads, but the boundary shape has not been verified against a real codex primary session, so no turn is claimed",
+          turn_trigger: "the wake and captain message shapes a codex primary session records have not been probed, so no classification is claimed"
+        },
         notes: "token_count is per model call, NOT per turn: one probed 908-line rollout carried 161 token_count records against 10 user_message records, and the running total_token_usage advanced by exactly last_token_usage on every record except 2 non-advancing re-emissions, which are recorded as duplicates and never counted as new calls."
       },
       grok: {
@@ -249,6 +287,10 @@ fm_ledger_capabilities() {
           tool_name: "a turn covers many tool calls; attributing turn tokens to one tool would be an estimate",
           phase: "phase classification needs per-call tool attribution",
           error_result: "no per-call result linkage at turn granularity"
+        },
+        not_implemented: {
+          turn_index: "grok records are already per turn, but which prompt opened each one has not been verified against a real grok primary session, so no turn index is claimed",
+          turn_trigger: "the wake and captain message shapes a grok primary session records have not been probed, so no classification is claimed"
         },
         notes: "prompt_history.jsonl and session_search.sqlite carry NO usage telemetry (the sqlite is an FTS index over transcripts); the usage lives in the per-session updates.jsonl at params.update.usage. grok is therefore NOT a blind spot for totals, but it is one for every per-call field."
       },
@@ -331,6 +373,101 @@ phase_confidence
 EOF
 }
 
+# --- turn segmentation rules (claude) ----------------------------------------
+#
+# Single owner of the boundary and trigger rules, printed by --turn-rules and
+# described in docs/token-baseline.md so a reader can judge them rather than
+# trust them.
+#
+# The wake verbs below are the watcher's own printed reason lines, whose
+# contract is owned by bin/fm-watch.sh's header; the wake sentence is emitted by
+# bin/fm-claude-stop-autoarm.sh; and the typed and legacy operational prefixes
+# come from bin/fm-operational-input.sh, sourced above rather than restated
+# here. A wake is recognised when ANY of those three independent signals
+# matches, so no single vendor or producer string is load-bearing on its own.
+TURN_WAKE_REASON_RE='(^|\n)(signal:|stale:|check:|heartbeat)'
+# Deliberately a FAMILY rather than one exact sentence: the wake and guard
+# wording has changed across releases and persisted transcripts still carry the
+# older forms, so recognition rests on several stable fragments at once.
+TURN_WAKE_SENTENCE_RE='firstmate watcher|Run bin/fm-wake-drain\.sh|TURN WOULD END BLIND|WATCHER DOWN|SUPERVISION IS OFF'
+TURN_WAKE_OP_KIND_RE='^(watcher|turn-end-guard|away-supervisor)$'
+# <id>.status, <id>.turn-ended and <id>.check.sh are the only task-naming tokens
+# a wake payload carries. The watcher writes them as full paths and the away
+# digest as bare file names, so the id is taken from either without crossing a
+# path separator. A stale wake names a backend window instead, which is not a
+# task id, so such a wake keeps an empty id list rather than being attributed to
+# a guessed task.
+TURN_TASK_ID_RE='(?:^|[\s/])([^/\s]+)\.(?:status|turn-ended|check\.sh)'
+TURN_LOCAL_COMMAND_RE='^<(command-name|command-message|local-command-stdout)>'
+TURN_SNIPPET_MAX=160
+
+fm_ledger_turn_rules() {
+  cat <<EOF
+fm-token-ledger turn segmentation (claude only; per SOURCE LOG)
+
+turn_index counts turn boundaries in one log, from 1. A call that no boundary
+precedes carries turn_index "unknown" and turn_trigger kind "unknown" - it is
+never folded into turn 1, because a resumed or compacted log can genuinely
+begin mid-turn.
+
+1. A record OPENS a turn when all of these hold:
+     type == "user"
+     isSidechain is not true              (a subagent prompt is not a fleet turn)
+     its content is a plain string, or an array with at least one text block
+     the array carries NO tool_result block   (a tool-result carrier continues a turn)
+     sourceToolUseID is absent            (a tool-sourced injection, e.g. skill
+                                           content, continues the turn its own
+                                           tool call belongs to)
+     its text does not start with "[Request interrupted"   (an interrupt closes
+                                           a turn rather than opening one)
+     isMeta is not true, UNLESS its trigger classifies as wake, session-start or
+     launch-brief - hook-injected turn openers are meta records, while local
+     command caveats, skill bodies and /context output are meta injections into
+     a turn already open.
+2. Every model call is attributed to the turn open when it was made, including
+   sidechain calls, which carry is_sidechain so a consumer can split them out.
+3. turn_trigger classifies the OPENING record, first match wins:
+     session-start   the typed operational session-start input, or the legacy
+                     session-start payload (bin/fm-operational-input.sh owns both)
+     launch-brief    the typed operational launch-brief input
+     captain         origin.kind "human" - what the runtime itself recorded as
+                     typed by a person, which outranks every payload marker
+                     below so a captain quoting a wake is not counted as one.
+                     Only the typed operational prefixes above outrank it, since
+                     firstmate injections are typed into the pane too
+     wake            any of: a typed or legacy operational watcher /
+                     turn-end-guard / away-supervisor input; a line matching
+                     $TURN_WAKE_REASON_RE;
+                     or the text $TURN_WAKE_SENTENCE_RE
+     task-notification  a <task-notification> wrapper, or origin.kind
+                     "task-notification", that carries no wake signal above
+     local-command   text matching $TURN_LOCAL_COMMAND_RE
+     captain         plain text matching no marker above
+     unknown         anything else, with a bounded raw snippet (<= $TURN_SNIPPET_MAX
+                     characters) in detail so the gap is inspectable
+   Logs written before the runtime recorded an origin carry no typed-by-a-human
+   evidence at all, so there a captain message quoting a wake payload verbatim
+   classifies as a wake. The payload markers are the only evidence such a log
+   contains, and inventing a stronger claim from prose would be a guess.
+4. wake_kind is read from the wake payload's own reason verbs (signal, stale,
+   check, heartbeat); "guard" when only the turn-end guard or auto-arm sentence
+   matched; otherwise the operational kind that established the wake (watcher,
+   turn-end-guard, away-supervisor), which an away-mode escalation digest
+   carries instead of a verb; and "unknown" when none of those is present. A
+   payload carrying more than one verb reports them joined with "+" (for
+   example "signal+stale") and is NEVER split between them.
+5. task_ids holds every id named by $TURN_TASK_ID_RE
+   in the payload, deduplicated. A wake naming several tasks keeps ALL of them:
+   its cost belongs to that shared set and is never divided between them. A
+   wake naming none - a stale wake names a backend window, not a task - keeps an
+   empty list rather than a guessed id.
+6. trigger_class groups a turn for rollups, exclusively:
+     captain-interaction   captain, launch-brief
+     wake-handling         wake other than heartbeat, task-notification
+     overhead              session-start, local-command, unknown, heartbeat wakes
+EOF
+}
+
 case "$MODE" in
   capabilities)
     if [ "$FORMAT" = json ]; then fm_ledger_capabilities; else fm_ledger_capabilities | jq .; fi
@@ -338,6 +475,10 @@ case "$MODE" in
     ;;
   phase-rules)
     fm_ledger_phase_rules
+    exit 0
+    ;;
+  turn-rules)
+    fm_ledger_turn_rules
     exit 0
     ;;
 esac
@@ -620,6 +761,99 @@ def classify($tools):
 JQ
 )
 
+# --- claude turn segmentation --------------------------------------------------
+#
+# Splices into the claude preamble only. --turn-rules above owns the rules this
+# implements; every marker it matches on arrives as a jq argument built from the
+# owning library's own constants, so the wire forms are not restated here.
+JQ_CLAUDE_TURNS=$(cat <<'JQ'
+# turn_text: the text a user record carries; "" when it carries none.
+def turn_text($rec):
+  if ($rec.message.content | type) == "string" then $rec.message.content
+  elif ($rec.message.content | type) == "array"
+    then ([ $rec.message.content[] | select(.type == "text") | (.text // "") ] | join("\n"))
+  else "" end;
+def turn_has_tool_result($rec):
+  ($rec.message.content | type) == "array"
+  and (([ $rec.message.content[] | select(.type == "tool_result") ] | length) > 0);
+# turn_op_kind: the operational kind of a typed or legacy operational input,
+# null when the text is not one. $MARK carries the wire forms verbatim from
+# bin/fm-operational-input.sh.
+def turn_op_kind($t):
+  if ($t | startswith($MARK.op_header))
+    then (($t[($MARK.op_header | length):]) | (capture("^(?<k>[a-z-]+):") | .k) // "unknown")
+  elif $t == $MARK.legacy_sessionstart then "session-start"
+  elif ($t | startswith($MARK.legacy_away_prefix)) then "away-supervisor"
+  elif ($t | startswith($MARK.legacy_watcher_prefix)) then "watcher"
+  elif ($t | startswith($MARK.legacy_turnend_prefix)) then "turn-end-guard"
+  elif ($t | startswith($MARK.op_prefix)) then "legacy-operational"
+  else null end;
+# turn_wake: the one wake record shape, so the two branches that can establish a
+# wake (an operational kind, and a payload signature) cannot describe it
+# differently.
+def turn_wake($t; $verbs; $sentence; $op):
+  { kind: "wake",
+    # More than one verb in one payload stays a SHARED bucket. Picking the
+    # first would claim to know which event the turn was really about.
+    wake_kind: (if ($verbs | length) > 0 then ($verbs | join("+"))
+                elif $sentence then "guard"
+                elif $op != null then $op else "unknown" end),
+    task_ids: ([ $t | match($TURN_TASKID; "g") | .captures[0].string ] | unique),
+    detail: "none" };
+# turn_trigger_of: rule 3 of --turn-rules, first match wins.
+def turn_trigger_of($rec):
+  turn_text($rec) as $t
+  | turn_op_kind($t) as $op
+  | (if ($rec.origin.kind | type) == "string" then $rec.origin.kind else null end) as $origin
+  | ([ $t | match($TURN_REASON; "g") | .captures[1].string | sub(":$"; "") ] | unique) as $verbs
+  | ($t | test($TURN_SENTENCE)) as $sentence
+  | { kind: "unknown", wake_kind: "none", task_ids: [], detail: "none" } as $base
+  | if $op == "session-start" then $base + { kind: "session-start" }
+    elif $op == "launch-brief" then $base + { kind: "launch-brief" }
+    # Every operational kind is decided before origin, because firstmate types
+    # its injections into the pane and the runtime records them as human origin.
+    elif ($op != null and ($op | test($TURN_OPKIND)))
+      then turn_wake($t; $verbs; $sentence; $op)
+    elif $op == "legacy-operational"
+      then $base + { detail: "untyped operational input; its subtype cannot be recovered - see bin/fm-operational-input.sh" }
+    # Otherwise a message the runtime itself recorded as typed by a person is
+    # the captain, even when it quotes a wake payload.
+    elif $origin == "human" then $base + { kind: "captain" }
+    elif (($verbs | length) > 0 or $sentence) then turn_wake($t; $verbs; $sentence; $op)
+    elif ($origin == "task-notification" or ($t | test("<task-notification>")))
+      then $base + { kind: "task-notification" }
+    elif ($t | test($TURN_LOCALCMD)) then $base + { kind: "local-command" }
+    # An unrecognised machine-shaped payload keeps a BOUNDED snippet so the gap
+    # is inspectable. Captain prose never reaches here, so chat text is not
+    # copied into a record by this path.
+    elif ($t | startswith("<"))
+      then $base + { detail: ($t | gsub("\\s+"; " ") | .[0:$SNIPMAX]) }
+    else $base + { kind: "captain" } end;
+# turn_opens: rule 1 of --turn-rules.
+def turn_opens($rec):
+  ($rec.type == "user")
+  and (($rec.isSidechain // false) != true)
+  and ((turn_has_tool_result($rec)) | not)
+  and ((turn_text($rec) | length) > 0)
+  and ($rec.sourceToolUseID == null)
+  and ((turn_text($rec) | startswith("[Request interrupted")) | not)
+  and (($rec.isMeta != true)
+       or (turn_trigger_of($rec).kind | test("^(wake|session-start|launch-brief)$")));
+# turn_map: assistant record uuid -> the turn open when that call was made.
+# Rule 2: a call made before any boundary carries a null index, which becomes
+# "unknown" at the output boundary rather than turn 1.
+def turn_map:
+  reduce .[] as $rec (
+    { map: {}, idx: 0, cur: null };
+    if turn_opens($rec) then .idx += 1 | .cur = turn_trigger_of($rec)
+    elif ($rec.type == "assistant" and ($rec.message.usage | type) == "object")
+      then .map[($rec.uuid // "")] = { turn_index: (if .idx == 0 then null else .idx end),
+                                       trigger: .cur }
+    else . end
+  ) | .map;
+JQ
+)
+
 # --- claude parser ------------------------------------------------------------
 #
 # ONE MODEL CALL == ONE requestId, NOT one assistant record - see
@@ -661,6 +895,10 @@ def result_index($all):
         });
 
 result_index(.) as $res
+# Turn segmentation runs over the SAME ordered records, so a call's turn comes
+# from the log's own order rather than from timestamps, which local commands are
+# not written in.
+| turn_map as $turns
 # Pass 2: GROUP contiguous assistant records into model calls by requestId, via
 # the shared claude_call_groups filter (bin/fm-token-dedup-lib.sh) - the single
 # owner of that grouping so this ledger and bin/fm-token-usage.sh can never
@@ -709,6 +947,10 @@ result_index(.) as $res
         granularity: "call",
         model_calls: (if $violated then "unknown" else 1 end),
         log_records: $g.records,
+        turn_index: (($turns[$g.uuids[0] // ""].turn_index) // "unknown"),
+        turn_trigger: (($turns[$g.uuids[0] // ""].trigger)
+                       // { kind: "unknown", wake_kind: "none", task_ids: [],
+                            detail: "no turn-opening user record precedes this call in this log" }),
         input_tokens: (if $violated then null else $t_in end | unk),
         cached_input_tokens: (if $violated then null else $t_cr end | unk),
         cache_write_tokens: (if $violated then null else $t_cw end | unk),
@@ -1009,6 +1251,18 @@ JQ
 
 # --- run ----------------------------------------------------------------------
 
+# The operational wire forms the turn classifier matches on, taken from the
+# library that owns them. Under set -u a renamed constant fails here loudly
+# rather than silently disabling a whole trigger class.
+TURN_MARKERS=$(jq -n \
+  --arg op_header "$FM_OPERATIONAL_HEADER_PREFIX" \
+  --arg op_prefix "$FM_OPERATIONAL_PREFIX" \
+  --arg legacy_sessionstart "$FM_LEGACY_SESSIONSTART" \
+  --arg legacy_away_prefix "$FM_LEGACY_AWAY_PREFIX" \
+  --arg legacy_watcher_prefix "$FM_LEGACY_WATCHER_PREFIX" \
+  --arg legacy_turnend_prefix "$FM_LEGACY_TURNEND_PREFIX" \
+  '$ARGS.named') || die "cannot build the turn-marker table"
+
 # fm_ledger_parse <harness> <log> <task>: print the parsed {calls,diagnostics}
 # object for one log. Unparseable lines are dropped by --seq-free slurp: jq's
 # stream parser stops at the first malformed line, so the file is filtered
@@ -1017,7 +1271,8 @@ fm_ledger_parse() {
   local harness=$1 log=$2 task=$3 prog preamble total kept dropped
   preamble=$JQ_COMMON
   case "$harness" in
-    claude) prog=$JQ_CLAUDE; preamble="$JQ_COMMON $FM_TOKEN_CLAUDE_CALL_GROUPS_JQ" ;;
+    claude) prog=$JQ_CLAUDE
+            preamble="$JQ_COMMON $FM_TOKEN_CLAUDE_CALL_GROUPS_JQ $JQ_CLAUDE_TURNS" ;;
     pi) prog=$JQ_PI ;;
     codex) prog=$JQ_CODEX ;;
     grok) prog=$JQ_GROK ;;
@@ -1038,6 +1293,13 @@ fm_ledger_parse() {
     --arg PB_SUPERVISION "$PHASE_BASH_SUPERVISION" \
     --arg PB_IMPLEMENTATION "$PHASE_BASH_IMPLEMENTATION" \
     --arg PB_DISCOVERY "$PHASE_BASH_DISCOVERY" \
+    --argjson MARK "$TURN_MARKERS" \
+    --arg TURN_REASON "$TURN_WAKE_REASON_RE" \
+    --arg TURN_SENTENCE "$TURN_WAKE_SENTENCE_RE" \
+    --arg TURN_OPKIND "$TURN_WAKE_OP_KIND_RE" \
+    --arg TURN_TASKID "$TURN_TASK_ID_RE" \
+    --arg TURN_LOCALCMD "$TURN_LOCAL_COMMAND_RE" \
+    --argjson SNIPMAX "$TURN_SNIPPET_MAX" \
     --argjson dropped_lines "$dropped" \
     "$preamble $prog"' | .diagnostics += {unparsed_lines: $dropped_lines, source_log: $source_log}
       | .calls |= map({task_id: (if $task == "" then "unknown" else $task end), source_log: $source_log} + .)'

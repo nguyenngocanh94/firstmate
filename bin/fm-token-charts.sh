@@ -24,7 +24,10 @@
 #   fm-token-charts.sh -h|--help
 #
 #   With no report paths, every data/token-reports/*.json under the effective
-#   home is rendered. Default output is data/token-reports/charts.html, which is
+#   home is considered. Only files declaring schema fm-token-report.v1 are
+#   rendered - the per-turn session reports written by --turns live in the same
+#   directory and carry none of these series - and every skip is announced on
+#   stderr by name. Default output is data/token-reports/charts.html, which is
 #   private and gitignored like the reports themselves.
 #
 # Requires jq. Reads reports, writes one HTML file.
@@ -63,7 +66,24 @@ if [ "${#REPORTS[@]}" -eq 0 ]; then
     REPORTS+=("$f")
   done
 fi
-[ "${#REPORTS[@]}" -gt 0 ] || die "no reports to render (looked in $FM_DATA/token-reports/)"
+
+# These four charts read the PER-TASK report shape. The same directory also
+# holds per-turn session reports (fm-token-turn-report.v1), which carry none of
+# those series, so a file is admitted only when it declares the schema this
+# renderer understands. Skipping by name is announced rather than silent: a
+# report that was written and then not drawn must not look like one that was
+# drawn.
+KEPT=()
+for f in "${REPORTS[@]}"; do
+  schema=$(jq -r 'if type == "object" then (.schema // "none") else "none" end' "$f" 2>/dev/null) || schema=
+  case "$schema" in
+    fm-token-report.v1) KEPT+=("$f") ;;
+    '') warn "skipping $f: not readable as a JSON report" ;;
+    *) warn "skipping $f: schema '$schema' is not fm-token-report.v1, which is the only shape these charts render" ;;
+  esac
+done
+REPORTS=("${KEPT[@]+"${KEPT[@]}"}")
+[ "${#REPORTS[@]}" -gt 0 ] || die "no per-task reports to render (looked in $FM_DATA/token-reports/)"
 
 [ -n "$OUT" ] || OUT="$FM_DATA/token-reports/charts.html"
 
