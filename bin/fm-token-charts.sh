@@ -74,7 +74,7 @@ fi
 # report that was written and then not drawn must not look like one that was
 # drawn.
 KEPT=()
-for f in "${REPORTS[@]}"; do
+for f in "${REPORTS[@]+"${REPORTS[@]}"}"; do
   schema=$(jq -r 'if type == "object" then (.schema // "none") else "none" end' "$f" 2>/dev/null) || schema=
   case "$schema" in
     fm-token-report.v1) KEPT+=("$f") ;;

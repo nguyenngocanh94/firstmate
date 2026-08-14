@@ -846,9 +846,10 @@ def turn_map:
   reduce .[] as $rec (
     { map: {}, idx: 0, cur: null };
     if turn_opens($rec) then .idx += 1 | .cur = turn_trigger_of($rec)
-    elif ($rec.type == "assistant" and ($rec.message.usage | type) == "object")
-      then .map[($rec.uuid // "")] = { turn_index: (if .idx == 0 then null else .idx end),
-                                       trigger: .cur }
+    elif ($rec.type == "assistant" and $rec.uuid != null
+          and ($rec.message.usage | type) == "object")
+      then .map[$rec.uuid] = { turn_index: (if .idx == 0 then null else .idx end),
+                               trigger: .cur }
     else . end
   ) | .map;
 JQ
