@@ -151,7 +151,8 @@ It rests on two ledger fields, `turn_index` and `turn_trigger`, and adds no new 
 
 - `turn_index` counts turn boundaries within one source log, from 1.
   A call that no boundary precedes is `unknown`, never folded into a turn 1 that was not observed, because a resumed or compacted log can genuinely begin mid-turn.
-- `turn_trigger` records what opened the turn: the captain, a watcher wake (with its `signal`, `stale`, `check` or `heartbeat` verb and the task ids the payload named), a background task notification, a local command, session start, or `unknown` with a bounded snippet.
+- `turn_trigger` records what opened the turn: the captain, a launch brief, a watcher wake, a background task notification, a local command, session start, or `unknown` with a bounded snippet.
+  A wake also carries a `wake_kind` - its reason verbs (`signal`, `stale`, `check`, `heartbeat`, joined with `+` when one payload carries several), or when no verb is present the guard sentence or operational kind that established it - and every task id the payload named.
 
 `fm-token-ledger.sh --turn-rules` prints the exact boundary and classification rules and is their single owner, so they cannot drift from this description.
 Three of those rules carry the measurement contract into this surface.
@@ -161,7 +162,7 @@ Three of those rules carry the measurement contract into this surface.
 - A message the runtime recorded as typed by a person is the captain, except when it carries firstmate's own operational marker; firstmate types its injections into the pane, so the marker is the only evidence that separates them.
 
 Per turn the report gives model calls, marginal tokens (the uncached input a turn actually added), cache read, output and gross tokens, alongside `calls` and `naive_log_record_count` exactly as the per-task report does.
-It then rolls those up per wake verb, per task bucket, and per trigger class - captain interaction, wake handling, and overhead.
+It then rolls those up per trigger kind, per wake kind, per task bucket, and per trigger class - captain interaction, wake handling, and overhead.
 
 Both report shapes land in the same private directory, and [`bin/fm-token-charts.sh`](../bin/fm-token-charts.sh) renders the per-task shape only.
 It admits a file by the schema the file declares and names any report it skips on stderr, so a report that was written but not drawn is never mistaken for one that was.
