@@ -1281,6 +1281,28 @@ assert_not_contains "$HOLE_HTML" ">0<" \
   "an unknown figure must never be rendered as 0"
 pass "the per-turn view omits and labels what the report calls unknown"
 
+# A wake-handling rollup whose marginal the ledger could not supply must not be
+# read as "wake cost nothing": the verdict states the gap instead of drawing a
+# measured 0% conclusion from an unknown.
+WHOLE_DIR="$TMP_ROOT/turn-wake-hole/token-reports"
+mkdir -p "$WHOLE_DIR"
+jq '.by_trigger_class += [ { "key": "wake-handling", "turns": 1, "calls": 1,
+      "marginal_tokens": "unknown", "cache_read_tokens": "unknown",
+      "output_tokens": "unknown", "gross_tokens": "unknown" } ]' \
+  "$HOLE_DIR/holes.json" > "$WHOLE_DIR/wakehole.json" \
+  || fail "the wake-hole fixture must be derivable from the holes report"
+WHOLE_OUT="$TMP_ROOT/turn-wake-hole.html"
+"$CHARTS" --out "$WHOLE_OUT" "$WHOLE_DIR/wakehole.json" >/dev/null 2>&1 \
+  || fail "the per-turn view must render a report whose wake rollup is unknown"
+WHOLE_HTML=$(cat "$WHOLE_OUT")
+assert_not_contains "$WHOLE_HTML" "Xử lý wake chiếm" \
+  "an unknown wake marginal must not be turned into a measured share of the session"
+assert_contains "$WHOLE_HTML" "chi phí biên của nhóm xử lý wake không đo được" \
+  "the verdict must state that the wake rollup was not measured"
+assert_contains "$WHOLE_HTML" "1 nhóm bị bỏ qua" \
+  "the unmeasured trigger-class group must be counted as omitted"
+pass "an unknown wake rollup is stated as unmeasured, never interpolated as 0%"
+
 # --- page framing flags: title, back-link and self-reload ---------------------
 #
 # These exist so bin/fm-token-board.sh can produce per-task pages that are named,
@@ -1296,7 +1318,7 @@ assert_contains "$FRAME_HTML" 'href="index.html"' "--back must render a relative
 assert_contains "$FRAME_HTML" '<meta http-equiv="refresh" content="30">' \
   "--refresh must make the page reload itself"
 assert_not_contains "$FRAME_HTML" "<script" "a reloading page must still carry no scripts"
-for bad in /abs/index.html https://example.invalid/x; do
+for bad in /abs/index.html https://example.invalid/x 'javascript:alert(1)'; do
   if "$CHARTS" --out "$TMP_ROOT/rejected.html" --back "$bad" "$HOLE_DIR/holes.json" \
     >/dev/null 2>&1; then
     fail "--back must refuse '$bad', which would not resolve as a static sibling"

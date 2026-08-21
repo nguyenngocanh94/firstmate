@@ -61,7 +61,9 @@
 #   --window <hours>   fleet window for the overview (default 24), passed
 #                      straight to bin/fm-token-usage.sh, which owns window math
 #   --interval <secs>  the loop interval the pages are told to expect (default
-#                      60); drives the per-task page reload and nothing else
+#                      60); drives both the per-task page reload and the
+#                      overview's stale-banner threshold (3x the interval, never
+#                      under 3 minutes), so raising it also delays that banner
 #   --max-live <n>     refresh at most n running tasks' reports per tick
 #                      (default 12)
 #   --no-refresh-reports  render from the reports already on disk and refresh
@@ -155,9 +157,20 @@ fm_board_publish() {
   mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; return 1; }
 }
 
-# fm_board_mtime <path>: epoch mtime, or 0 when the file is absent.
+# fm_board_mtime <path>: epoch mtime, or 0 when the file is absent. stat's flags
+# differ between BSD and GNU and the GNU build prints filesystem stats for -f
+# instead of failing quietly, so the platform is decided once rather than by
+# chaining the two forms.
+_FM_BOARD_UNAME=$(uname -s 2>/dev/null || printf 'unknown\n')
 fm_board_mtime() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || printf '0\n'
+  local m
+  if [ "$_FM_BOARD_UNAME" = Darwin ]; then
+    m=$(stat -f %m "$1" 2>/dev/null) || m=
+  else
+    m=$(stat -c %Y "$1" 2>/dev/null) || m=
+  fi
+  case "$m" in ''|*[!0-9]*) m=0 ;; esac
+  printf '%s\n' "$m"
 }
 
 NOTES_JSON='[]'
@@ -269,7 +282,10 @@ fi
 
 # fm_board_latest_log <home>: the most recently written Claude session log of
 # that home, or nothing. A home may hold many sessions; the board reports the one
-# still being written, and the page names the session it read.
+# still being written, and the page names the session it read. Everything under
+# CLAUDE_PROJECTS is a Claude session log by construction, so the harness is
+# stated to the ledger rather than left to its path-shape guess, which only
+# recognises a directory literally named .claude/projects.
 fm_board_latest_log() {
   local home=$1 candidate dir newest='' newest_m=0 f m
   while IFS= read -r candidate; do
@@ -298,11 +314,12 @@ LIVE_REPORTS=("${LIVE_TASKS[@]+"${LIVE_TASKS[@]}"}")
 fm_board_turn_report() {  # <source> <label> <home>
   local source=$1 label=$2 home=$3 log out refreshed_now=0
   out="$REPORTS_DIR/$label.turns.json"
-  if [ "$TURNS_SUPPORTED" = 1 ]; then
+  if [ "$TURNS_SUPPORTED" = 1 ] && [ "$REFRESH_REPORTS" = 1 ]; then
     log=$(fm_board_latest_log "$home")
     if [ -z "$log" ]; then
       note "$source: không tìm thấy log session cho home của nó, nên chưa có view per-turn"
-    elif "$REPORT_TOOL" --turns --session "$log" --task-label "$label" >/dev/null 2>&1; then
+    elif "$REPORT_TOOL" --turns --session "$log" --task-label "$label" \
+      --harness claude >/dev/null 2>&1; then
       refreshed_now=1
     else
       note "$source: không làm mới được báo cáo per-turn ở tick này"

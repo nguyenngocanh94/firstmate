@@ -42,8 +42,16 @@ encode() { printf '%s' "$1" | tr '/.' '--'; }
 
 # mtime in seconds, or 0 when absent: enough to prove a file was or was not
 # rewritten by a later tick.
+TEST_UNAME=$(uname -s 2>/dev/null || printf 'unknown\n')
 fm_board_test_mtime() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || printf '0\n'
+  local m
+  if [ "$TEST_UNAME" = Darwin ]; then
+    m=$(stat -f %m "$1" 2>/dev/null) || m=
+  else
+    m=$(stat -c %Y "$1" 2>/dev/null) || m=
+  fi
+  case "$m" in ''|*[!0-9]*) m=0 ;; esac
+  printf '%s\n' "$m"
 }
 
 # claude_call <file> <requestId> <uuid> <in> <cache-write> <cache-read> <out>
@@ -305,11 +313,11 @@ assert_not_contains "$SESS_HTML" 'http-equiv="refresh"' \
 
 # The primary's own session IS rewritten each tick, so its page is the live one.
 prim=$(jq -c '.sessions[] | select(.source == "primary")' "$FEED")
-if [ -n "$prim" ]; then
-  prim_page=$(printf '%s' "$prim" | jq -r '.page')
-  assert_contains "$(cat "$BOARD_DIR/$prim_page")" '<meta http-equiv="refresh" content="45">' \
-    "a session report refreshed this tick must reload itself like a running task"
-fi
+[ -n "$prim" ] \
+  || fail "the primary session's own per-turn report must reach the feed as a session row"
+prim_page=$(printf '%s' "$prim" | jq -r '.page')
+assert_contains "$(cat "$BOARD_DIR/$prim_page")" '<meta http-equiv="refresh" content="45">' \
+  "a session report refreshed this tick must reload itself like a running task"
 pass "per-turn reports render as their own page and reconcile with the report exactly"
 
 # --- 6. budget, fleet totals and mates ---------------------------------------
@@ -346,10 +354,16 @@ pass "a running task re-renders each tick while an unchanged finished task costs
 # --- 8. --no-refresh-reports leaves the reports alone ------------------------
 
 report_before=$(fm_board_test_mtime "$REPORT")
+turns_report="$HOME_DIR/data/token-reports/primary.turns.json"
+turns_before=$(fm_board_test_mtime "$turns_report")
+[ "$turns_before" != 0 ] \
+  || fail "the primary's per-turn report must exist before the --no-refresh-reports tick"
 sleep 1
 run_board --no-refresh-reports >/dev/null 2>&1 || fail "the board tick failed with --no-refresh-reports"
 [ "$(fm_board_test_mtime "$REPORT")" = "$report_before" ] \
   || fail "--no-refresh-reports must not rewrite a report snapshot"
+[ "$(fm_board_test_mtime "$turns_report")" = "$turns_before" ] \
+  || fail "--no-refresh-reports must not rewrite a session's per-turn report either"
 pass "--no-refresh-reports renders from the reports already on disk"
 
 # --- 9. the board writes nothing into the tracked repo ------------------------

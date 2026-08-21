@@ -101,7 +101,10 @@ esac
 # directory, so an absolute or off-host target is refused rather than written.
 case "$BACK" in
   '') ;;
-  /*|*://*|*'"'*) die "--back must be a relative same-directory href" ;;
+  /*|*'"'*) die "--back must be a relative same-directory href" ;;
+  *) case "${BACK%%/*}" in
+       *:*) die "--back must be a relative same-directory href" ;;
+     esac ;;
 esac
 
 if [ "${#REPORTS[@]}" -eq 0 ]; then
@@ -312,8 +315,15 @@ def turn_verdict($rep):
   ($rep.totals) as $T
   | ($rep.by_trigger_class // []) as $cls
   | ([ $cls[] | num(.marginal_tokens) | select(. != null) ] | add // 0) as $margtot
-  | (($cls | map(select(.key == "wake-handling")) | first | num(.marginal_tokens)) // 0) as $wake
-  | if $margtot == 0 then "<p class=\"muted\">chưa đo được chi phí biên nào trong phiên này.</p>"
+  | (($cls | length) - ([ $cls[] | select(num(.marginal_tokens) != null) ] | length)) as $om
+  | (if $om > 0 then "<p class=\"muted\">\($om) nhóm bị bỏ qua: marginal không đo được, không nội suy.</p>" else "" end) as $omnote
+  | ($cls | map(select(.key == "wake-handling")) | first) as $wrow
+  | (if $wrow == null then 0 else num($wrow.marginal_tokens) end) as $wake
+  | if $margtot == 0 then "<p class=\"muted\">chưa đo được chi phí biên nào trong phiên này.</p>" + $omnote
+    elif $wake == null then
+      "<p><span class=\"pill p-ok\">đo thật, không ước lượng</span></p>"
+      + "<p class=\"muted\">chi phí biên của nhóm xử lý wake không đo được, nên không kết luận gì về tỉ trọng wake của phiên này.</p>"
+      + $omnote
     else
       (($wake / $margtot) * 100) as $wpct
       | "<p><span class=\"pill p-ok\">đo thật, không ước lượng</span></p>"
@@ -325,6 +335,7 @@ def turn_verdict($rep):
              + (($T.cache_read_tokens / $T.marginal_tokens) | round | tostring)
              + " lần marginal): muốn giảm burn thì giảm nền context, không phải giảm wake." end)
         + "</p>"
+        + $omnote
     end;
 
 def turn_share($rep):
