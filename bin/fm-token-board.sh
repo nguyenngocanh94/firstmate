@@ -19,6 +19,12 @@
 #                               produces no such report and the board says so
 #   page rendering              bin/fm-token-charts.sh, which owns every chart
 #
+# KNOWN LIMITATION - LIVENESS IS LOCAL. Fleet burn covers every registered home,
+# but the liveness scan and the report lookup read only this home's state and
+# data, so a task owned by a secondmate home shows up with burn and no status.
+# The board renders that honestly ("không thấy từ home này") instead of calling
+# it done; full cross-home live-task visibility is filed as its own follow-up.
+#
 # MARGINAL IS NOT CACHE READ. Every view keeps uncached input (input + cache
 # write - what a call actually ADDED) visually and numerically distinct from
 # cache read (context re-sent and re-read on every call). Collapsing them into
@@ -50,7 +56,10 @@
 #     budget is configured, or when the budget window equals --window).
 #   * report snapshots are refreshed only for tasks that are still running, and
 #     at most --max-live of them.
-#   * a task page is re-rendered only when its report is newer than the page.
+#   * a task page is re-rendered only when its report is newer than the page, or
+#     when its reload tag no longer matches whether the task is still running.
+#     Mtimes are compared in nanoseconds, so a report and its page landing in the
+#     same wall-clock second do not read as a change.
 #
 # Usage:
 #   fm-token-board.sh [--out-dir <path>] [--window <hours>] [--interval <secs>]
@@ -157,20 +166,31 @@ fm_board_publish() {
   mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; return 1; }
 }
 
-# fm_board_mtime <path>: epoch mtime, or 0 when the file is absent. stat's flags
-# differ between BSD and GNU and the GNU build prints filesystem stats for -f
-# instead of failing quietly, so the platform is decided once rather than by
-# chaining the two forms.
+# fm_board_mtime <path>: mtime in NANOSECONDS as an integer, or 0 when the file
+# is absent. Whole seconds are too coarse for the skip-unchanged guard: a report
+# written and its page rendered inside the same wall-clock second compare equal,
+# so every later tick would re-render a page whose report never changed. stat's
+# flags differ between BSD and GNU and the GNU build prints filesystem stats for
+# -f instead of failing quietly, so the platform is decided once rather than by
+# chaining the two forms; a stat without sub-second support falls back to whole
+# seconds scaled to nanoseconds.
 _FM_BOARD_UNAME=$(uname -s 2>/dev/null || printf 'unknown\n')
 fm_board_mtime() {
-  local m
+  local m sec frac
   if [ "$_FM_BOARD_UNAME" = Darwin ]; then
-    m=$(stat -f %m "$1" 2>/dev/null) || m=
+    m=$(stat -f %Fm "$1" 2>/dev/null) || m=
+    case "$m" in ''|*[!0-9.]*) m=$(stat -f %m "$1" 2>/dev/null) || m= ;; esac
   else
-    m=$(stat -c %Y "$1" 2>/dev/null) || m=
+    m=$(stat -c %.9Y "$1" 2>/dev/null) || m=
+    case "$m" in ''|*[!0-9.]*) m=$(stat -c %Y "$1" 2>/dev/null) || m= ;; esac
   fi
-  case "$m" in ''|*[!0-9]*) m=0 ;; esac
-  printf '%s\n' "$m"
+  sec=${m%%.*}
+  frac=${m#*.}
+  [ "$frac" = "$m" ] && frac=
+  case "$sec" in ''|*[!0-9]*) printf '0\n'; return 0 ;; esac
+  case "$frac" in *[!0-9]*) frac= ;; esac
+  frac="${frac}000000000"
+  printf '%s%s\n' "$sec" "${frac:0:9}"
 }
 
 NOTES_JSON='[]'
@@ -371,7 +391,20 @@ for report in "$REPORTS_DIR"/*.json; do
   # Only a page whose numbers are still moving needs to reload itself; a
   # finished task's page is final and reloading it would just churn.
   [ "$live" = 1 ] && refresh_arg=$INTERVAL
-  if [ "$(fm_board_mtime "$report")" -ge "$(fm_board_mtime "$OUT_DIR/$page")" ]; then
+  rerender=0
+  [ "$(fm_board_mtime "$report")" -gt "$(fm_board_mtime "$OUT_DIR/$page")" ] && rerender=1
+  # A task that has just stopped moving leaves behind a page still telling the
+  # browser to reload itself, and its report will never change again to trigger
+  # a rewrite. So a page whose reload tag disagrees with this tick's liveness is
+  # re-rendered once, and then stays skipped.
+  if [ "$rerender" = 0 ] && [ -f "$OUT_DIR/$page" ]; then
+    if [ "$refresh_arg" = 0 ]; then
+      grep -q 'http-equiv="refresh"' "$OUT_DIR/$page" && rerender=1
+    else
+      grep -q "http-equiv=\"refresh\" content=\"$refresh_arg\"" "$OUT_DIR/$page" || rerender=1
+    fi
+  fi
+  if [ "$rerender" = 1 ]; then
     if ! "$CHARTS_TOOL" --out "$OUT_DIR/$page" --back index.html \
       --title "$report_id" --refresh "$refresh_arg" "$report" >/dev/null 2>&1; then
       note "$report_id: không dựng được trang từ ${base}.json"
@@ -462,7 +495,8 @@ FEED=$(jq -n \
         claude_projects: $fleet.claude_projects,
         marginal_note: "marginal = input chưa cache (input + cache write): cái một call TỐN THÊM. cache read là context gửi lại và đọc lại ở mỗi call; hai con số này không bao giờ được cộng thành một.",
         scope_note: "burn của fleet chỉ đọc từ log session Claude - đúng phạm vi của reader; task chạy runtime khác vẫn hiện báo cáo riêng của nó nếu có.",
-        unknown_note: "giá trị mà báo cáo ghi là unknown thì hiển thị đúng unknown, không bao giờ nội suy."
+        unknown_note: "giá trị mà báo cáo ghi là unknown thì hiển thị đúng unknown, không bao giờ nội suy.",
+        liveness_note: "trạng thái sống/chết chỉ đọc từ home này: task do home khác giữ hiện \"không thấy từ home này\" chứ không bị coi là đã xong."
       },
       fleet: {
         window_hours: $fleet.window_hours,
@@ -502,11 +536,18 @@ FEED=$(jq -n \
                   | ($src | map(select(.source == ("task:" + $id))) | first) as $s
                   | ($deliv | map(select(.task == ("task:" + $id))) | first) as $d
                   | ($by_id[$id]) as $r
+                  | ($live_of[$id] != null) as $islive
                   | { id: $id,
-                      live: ($live_of[$id] != null),
+                      live: $islive,
+                      # A task this home can account for: either its runtime
+                      # record is still here, or its report was written here.
+                      # Anything else burned in the window from a home whose
+                      # state this reader cannot see, so its status is unknown
+                      # rather than finished.
+                      visible: ($islive or $r != null),
                       kind: ($live_of[$id].kind // null),
                       project: ($live_of[$id].project // null),
-                      title: ($d.title // null),
+                      title: (if ($d.title // "-") == "-" then null else $d.title end),
                       artifact: (if ($d.artifact // "-") == "-" then null else $d.artifact end),
                       outcome: ($r.outcome // null),
                       page: ($r.page // null),
@@ -718,12 +759,19 @@ function render(d){
       const art = t.artifact || (t.outcome && t.outcome !== 'unknown' ? t.outcome : null);
       const artHtml = art && /^(pr:)?https?:\/\//.test(art)
         ? '<a href="' + esc(art.replace(/^pr:/, '')) + '">PR</a>'
-        : art ? '<span class="muted">' + esc(art) + '</span>' : '<span class="muted">—</span>';
+        : art ? '<span class="muted">' + esc(art) + '</span>'
+        : '<span class="muted">' + (t.visible === false ? 'không rõ' : '—') + '</span>';
+      const state = t.live ? '<span class="pill p-live">● đang chạy</span>'
+        : (t.visible === false
+            ? '<span class="pill p-warn" title="Task này có burn trong cửa sổ nhưng home này không giữ runtime record ' +
+              'lẫn báo cáo của nó, nên board không biết nó còn chạy hay đã xong.">? không thấy từ home này</span>'
+            : '<span class="muted">xong</span>');
       return '<tr><td>' + name + title + '</td>' +
-        '<td>' + (t.live ? '<span class="pill p-live">● đang chạy</span>' : '<span class="muted">xong</span>') + '</td>' +
+        '<td>' + state + '</td>' +
         '<td>' + (w ? splitBar(w.marginal, w.cache_read, taskMax) : '<span class="muted">ngoài cửa sổ</span>') + '</td>' +
         '<td class="num">' + (w ? fmt(w.tokens) : '—') + '</td>' +
-        '<td class="num">' + (t.report ? fmt(t.report.marginal) : '<span class="muted">chưa có báo cáo</span>') + '</td>' +
+        '<td class="num">' + (t.report ? fmt(t.report.marginal)
+          : '<span class="muted">' + (t.visible === false ? 'không có báo cáo ở home này' : 'chưa có báo cáo') + '</span>') + '</td>' +
         '<td class="num">' + (t.report ? fmt(t.report.cache_read) : '—') + '</td>' +
         '<td>' + artHtml + '</td></tr>';
     }).join('') : '<tr><td colspan="7" class="muted">chưa có task nào</td></tr>');
@@ -758,7 +806,9 @@ function render(d){
 
   document.getElementById('foot').innerHTML =
     esc(d.measurement.marginal_note) + '<br>' + esc(d.measurement.scope_note) + '<br>' +
-    esc(d.measurement.unknown_note) + '<br>Sinh bởi <code>bin/fm-token-board.sh</code> lúc ' +
+    esc(d.measurement.unknown_note) +
+    (d.measurement.liveness_note ? '<br>' + esc(d.measurement.liveness_note) : '') +
+    '<br>Sinh bởi <code>bin/fm-token-board.sh</code> lúc ' +
     esc(d.generated) + ' từ <code>bin/fm-token-usage.sh</code> và <code>data/token-reports/</code>.';
 }
 

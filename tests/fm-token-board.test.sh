@@ -375,4 +375,77 @@ esac
   || fail "the board must never write into the checked-out repo's data directory"
 pass "generated board output stays private to the operational home"
 
+# --- 10. an unchanged finished report is never re-rendered -------------------
+#
+# Regression: the guard compared whole-second mtimes with -ge, so a report and
+# its page landing inside the same wall-clock second read as "report is newer"
+# and every later tick re-rendered a page whose report had not changed. Forcing
+# the report's timestamp onto the page's own reproduces exactly that collision.
+
+touch -r "$BOARD_DIR/$done_page" "$HOME_DIR/data/token-reports/task-done.json"
+done_before=$(fm_board_test_mtime "$BOARD_DIR/$done_page")
+sleep 1
+run_board >/dev/null 2>&1 || fail "the board tick failed after the mtime collision"
+[ "$(fm_board_test_mtime "$BOARD_DIR/$done_page")" = "$done_before" ] \
+  || fail "a report sharing its page's timestamp must not count as newer than the page"
+pass "an unchanged finished report is not re-rendered when it shares the page's second"
+
+# --- 11. a task this home cannot see is never rendered as done ----------------
+#
+# Fleet attribution covers every registered home, so a task owned by a
+# secondmate home reaches the feed with burn while this home holds neither its
+# runtime record nor its report. That is an unknown status, not a finished one.
+
+MATE_HOME="$TMP_ROOT/mate-home"
+mkdir -p "$MATE_HOME/state" "$WT/task-elsewhere"
+printf -- '- mate-x - fixture secondmate (home: %s; scope: fixture; projects: fixture; added 2026-08-13)\n' \
+  "$MATE_HOME" > "$HOME_DIR/data/secondmates.md"
+fm_write_meta "$MATE_HOME/state/task-elsewhere.meta" \
+  "window=fixture:task-elsewhere" \
+  "endpoint_task_id=task-elsewhere" \
+  "worktree=$WT/task-elsewhere" \
+  "project=$WT/task-elsewhere" \
+  "harness=claude" \
+  "kind=ship" \
+  "mode=no-mistakes" \
+  "yolo=off"
+ELSEWHERE_LOG="$PROJECTS/$(encode "$WT/task-elsewhere")/elsewhere-session.jsonl"
+claude_call "$ELSEWHERE_LOG" e1 eu1 11 9 300 17
+
+run_board >/dev/null 2>&1 || fail "the board tick failed with a secondmate-owned task"
+away=$(jq -c '.tasks[] | select(.id == "task-elsewhere")' "$FEED")
+[ -n "$away" ] || fail "a task burning tokens from another home must still be listed"
+[ "$(printf '%s' "$away" | jq -r '.window.marginal')" = 20 ] \
+  || fail "the other home's task must carry the reader's own attribution of its burn"
+[ "$(printf '%s' "$away" | jq -r '.live')" = false ] \
+  || fail "this home holds no runtime record for that task, so it cannot claim it is running"
+[ "$(printf '%s' "$away" | jq -r '.visible')" = false ] \
+  || fail "a task with burn but neither a local runtime record nor a local report must be marked not visible from this home"
+[ "$(printf '%s' "$away" | jq -r '.report')" = null ] \
+  || fail "there is no local report for that task, and none may be invented"
+[ "$(printf '%s' "$away" | jq -r '.page')" = null ] \
+  || fail "a task with no local report must not claim a page"
+[ "$(printf '%s' "$away" | jq -r '.outcome')" = null ] \
+  || fail "a task this home cannot see has no measured outcome"
+
+# A locally accounted task stays distinguishable from that state, whether it is
+# running or finished - otherwise "not visible" would say nothing.
+[ "$(jq -r '.tasks[] | select(.id == "task-a") | .visible' "$FEED")" = true ] \
+  || fail "a task whose runtime record is here must be visible from this home"
+[ "$(jq -r '.tasks[] | select(.id == "task-done") | .visible' "$FEED")" = true ] \
+  || fail "a task whose report was written here must be visible from this home"
+pass "a task owned by another home is marked not visible instead of done"
+
+# --- 12. the absent-title sentinel is not printed as a title -----------------
+#
+# task-elsewhere has a meta but no backlog line, so the reader's deliverable row
+# carries "-" for its title. That sentinel means "no title", and the board must
+# not hand the overview a task subtitled with a bare dash.
+[ "$(printf '%s' "$away" | jq -r '.title')" = null ] \
+  || fail "the reader's '-' absent-title sentinel must reach the feed as null"
+[ "$(jq -r '.tasks[] | select(.id == "task-a") | .title' "$FEED")" \
+  = "A running fixture task" ] \
+  || fail "a task with a real backlog title must still carry it"
+pass "an absent title is null in the feed, never a bare dash"
+
 pass "all fm-token-board behavior tests passed"

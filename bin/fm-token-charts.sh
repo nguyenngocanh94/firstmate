@@ -315,15 +315,12 @@ def turn_verdict($rep):
   ($rep.totals) as $T
   | ($rep.by_trigger_class // []) as $cls
   | ([ $cls[] | num(.marginal_tokens) | select(. != null) ] | add // 0) as $margtot
-  | (($cls | length) - ([ $cls[] | select(num(.marginal_tokens) != null) ] | length)) as $om
-  | (if $om > 0 then "<p class=\"muted\">\($om) nhóm bị bỏ qua: marginal không đo được, không nội suy.</p>" else "" end) as $omnote
   | ($cls | map(select(.key == "wake-handling")) | first) as $wrow
   | (if $wrow == null then 0 else num($wrow.marginal_tokens) end) as $wake
-  | if $margtot == 0 then "<p class=\"muted\">chưa đo được chi phí biên nào trong phiên này.</p>" + $omnote
+  | if $margtot == 0 then "<p class=\"muted\">chưa đo được chi phí biên nào trong phiên này.</p>"
     elif $wake == null then
       "<p><span class=\"pill p-ok\">đo thật, không ước lượng</span></p>"
       + "<p class=\"muted\">chi phí biên của nhóm xử lý wake không đo được, nên không kết luận gì về tỉ trọng wake của phiên này.</p>"
-      + $omnote
     else
       (($wake / $margtot) * 100) as $wpct
       | "<p><span class=\"pill p-ok\">đo thật, không ước lượng</span></p>"
@@ -335,14 +332,16 @@ def turn_verdict($rep):
              + (($T.cache_read_tokens / $T.marginal_tokens) | round | tostring)
              + " lần marginal): muốn giảm burn thì giảm nền context, không phải giảm wake." end)
         + "</p>"
-        + $omnote
     end;
 
 def turn_share($rep):
   ($rep.by_trigger_class // []) as $cls
   | [ $cls[] | select(num(.marginal_tokens) != null) ] as $ok
   | ([ $ok[].marginal_tokens ] | add // 0) as $tot
-  | if $tot == 0 then "<p class=\"muted\">không có chi phí biên để chia theo nguồn kích hoạt.</p>"
+  | if $tot == 0 then "<p class=\"muted\">không có chi phí biên để chia theo nguồn kích hoạt"
+      + ((($cls | length) - ($ok | length)) as $om
+         | if $om > 0 then ": \($om) nhóm bị bỏ qua, marginal không đo được, không nội suy." else "." end)
+      + "</p>"
     else
       "<div class=\"share\">"
       + ([ $ok[] | turn_class(.key) as $c
