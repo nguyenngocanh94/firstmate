@@ -1,0 +1,3 @@
+[   60219ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8791/board-data.js?ts=1787280745282:0
+[   80219ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8791/board-data.js?ts=1787280765282:0
+[  100175ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:8791/board-data.js?ts=1787280785238:0

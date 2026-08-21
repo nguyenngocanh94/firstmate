@@ -321,9 +321,46 @@ A fixture built from claude's encoding would have matched nothing here, which is
 grok's is a plain percent-encoding of the absolute path.
 The rules themselves are owned by `bin/fm-token-ledger.sh`'s resolution code and the comment above it.
 
+## The fleet board on the real fleet, 2026-08-14
+
+`bin/fm-token-board.sh` was run against the real operational home on macOS 26.5.2 with jq 1.7.1, reading that home's live state and reports while writing its own output to a scratch directory, so the check never wrote into the captain's home.
+
+```console
+$ FM_HOME=/Volumes/Work/AI/firstmate FM_DATA_OVERRIDE=/tmp/fmboard-data \
+    bin/fm-token-board.sh --out-dir /tmp/fmboard-real
+/tmp/fmboard-real/index.html
+```
+
+One tick took 25.8-29.4s wall across four runs on that host, dominated by the two `fm-token-usage.sh` window reads (24h board window plus the 4h budget window) over 45 Claude session logs.
+That is the cost the 60s loop interval is chosen against; a home with more session history needs a longer interval, not a different tool.
+
+**The two measurement paths agree.**
+For the running task the fleet reader's own attribution and the task's report reached the same gross figure independently - `tasks[].window.tokens` and `tasks[].report.gross` were both `7534290` on the first tick - and each per-turn session row matched its report exactly:
+
+```console
+$ jq -r '.sessions[] | "\(.id) turns=\(.turns) calls=\(.calls) marginal=\(.marginal) gross=\(.gross)"' \
+    /tmp/fmboard-real/board-data.json
+mate-mexcmate turns=57 calls=363 marginal=1980941 gross=95673608
+mate-primary-2026-08-14 turns=10 calls=51 marginal=129015 gross=6070052
+mate-vaultmate turns=39 calls=414 marginal=1427622 gross=113329536
+primary turns=15 calls=106 marginal=191013 gross=16460936
+$ jq -r '.totals | "\(.turns) \(.calls) \(.marginal_tokens) \(.gross_tokens)"' \
+    /tmp/fmboard-data/token-reports/mate-mexcmate.turns.json
+57 363 1980941 95673608
+```
+
+**A running task's numbers move without regenerating by hand.**
+With the documented loop armed, three consecutive feeds carried `generated_ms` 1786682739000, 1786682791000 and 1786682884000, and the running task's own report advanced 45 → 68 → 102 model calls and 7,534,290 → 20,708,369 → 23,223,427 gross tokens across them.
+A task whose runtime record was removed mid-observation moved from the running marking to its final report figures on the following tick, with no intervention.
+
+**Stopping the loop trips the banner.**
+After killing the loop the feed stopped advancing, and at a feed age of 191s the overview - reloaded in Chrome against a plain static server, which is the only serving mode these pages need - showed the stale banner naming the elapsed time and printing the arm command to restart, in place of a silently ageing set of numbers.
+
 ## Suites
 
 ```console
+$ bash tests/fm-token-board.test.sh | tail -1
+ok - all fm-token-board behavior tests passed
 $ bash tests/fm-token-baseline.test.sh | tail -1
 ok - all fm-token-baseline behavior tests passed
 $ bash tests/fm-token-usage.test.sh | tail -1
@@ -347,8 +384,17 @@ The first pins what opens a turn: a tool-result carrier does not, even when it a
 It also pins that a wake keeps every task it named, that a stale wake naming only a backend window keeps an empty id list, that an away escalation carrying firstmate's operational marker is a wake rather than the captain despite its human origin, and that a log beginning mid-turn reports `unknown` rather than a guessed turn 1.
 The second pins the per-turn report: the per-turn rows, `by_trigger_class`, `by_trigger_kind` and `by_task` each partition the ledger's own token sums exactly once, a multi-task wake forms one shared bucket and never appears as a per-task one, turns naming no task land in `unattributed`, and a heartbeat-only wake counts as overhead while other wakes count as wake handling.
 Each of those boundary rules was mutation-checked by removing it from the ledger and confirming the suite fails, so none of them is a vacuous assertion.
-A third section covers the two shapes sharing one private directory: the chart renderer still produces a page, names the per-turn report it skipped, and refuses with a specific reason once no per-task report remains.
-Without the schema filter that case fails with `Cannot iterate over null`, which is what the mutation check confirms.
+A third section covers the two shapes sharing one private directory: the chart renderer draws both from one invocation - the per-task charts and the per-turn view - names an unknown-schema and an unreadable file it leaves behind, and refuses with a specific reason once neither shape remains.
+Without the schema dispatch that case fails with `Cannot iterate over null`, which is what the mutation check confirms.
+A fourth section renders a per-turn report carrying unknowns and pins that the view omits and counts an unknown-marginal turn instead of drawing it at zero, prints an unknown rollup figure as `unknown`, and reports both the turns with no index and the calls that fit no turn.
+It also pins the wake rollup specifically: a wake-handling group whose marginal the ledger could not supply is stated as unmeasured and counted as omitted, never turned into a measured share of the session.
+A fifth pins the page framing flags the board depends on - the page title, a relative back-link, and the self-reload meta - including that an absolute, scheme-bearing or off-host back-link is refused and writes no page, and that a page rendered without them carries no reload and still no scripts.
+
+`tests/fm-token-board.test.sh` covers the board against a synthesised home and Claude session root, with every fixture bucket held under 1000 tokens so a figure a page prints is the figure the report carries with no rounding in between.
+It pins that a running task's row equals both the report's own totals and the fleet reader's independent attribution of the same session, that a total the report calls `unknown` stays `unknown` rather than becoming 0, that marginal and cache read remain separate fields and separately coloured series, that per-turn rows reconcile field for field with their turn report, and that the configured budget reaches the gauge on its own window rather than the board's.
+It also pins the cost bound and the live/finished split directly: a running task's page carries the meta refresh and is re-rendered each tick, while a finished task's page carries none and is not rewritten while its report is unchanged, including when the report and its page share a wall-clock second.
+The local-liveness limit has its own case: a task that burned tokens in the window while this home holds neither its runtime record nor its report reaches the feed with the reader's own attribution, marked not visible from this home rather than live, finished, or carrying an invented report, page or outcome - and a task this home does account for stays distinguishable from it.
+The same section pins that the reader's `-` absent-title sentinel reaches the feed as `null` while a real backlog title survives.
 
 `tests/fm-teardown.test.sh` gains five token-report cases.
 Three are fail-open cases: a reporter that genuinely fails (an empty session-log root, so the ledger cannot resolve a log), one that is genuinely still working when the bound fires (a rollout whose first line is 200MB), and one where a codex task's session genuinely cannot be mapped (an empty codex session root).

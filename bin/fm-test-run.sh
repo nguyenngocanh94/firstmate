@@ -141,6 +141,7 @@ family_for_basename() {
     fm-documentation-audiences.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
     fm-kimi-harness.test.sh|fm-herdr-lab.test.sh|fm-lint.test.sh|\
     fm-path-identity.test.sh|fm-token-usage.test.sh|fm-token-baseline.test.sh|\
+    fm-token-board.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
     fm-send-popup-settle.test.sh|fm-send-settle.test.sh|\
     fm-subagent-pretool-check.test.sh|\

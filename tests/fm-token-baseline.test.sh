@@ -1174,8 +1174,9 @@ done
   || fail "--turn-rules must print the rules it owns"
 pass "turn fields are declared per runtime, and the rules have a single printed owner"
 
-# Both report shapes share one private directory, so the chart renderer must
-# take the per-task one and say so when it leaves the other behind.
+# Both report shapes share one private directory, and the chart renderer draws
+# each by the schema it declares - the per-task charts, and the per-turn view of
+# a primary or mate session. Anything else it leaves behind, by name.
 MIX_HOME="$TMP_ROOT/mixed"
 mkdir -p "$MIX_HOME/state" "$MIX_HOME/data"
 mix_report() {  # <extra-report-flags...>
@@ -1184,20 +1185,150 @@ mix_report() {  # <extra-report-flags...>
 }
 mix_report || fail "the per-task report for the mixed directory failed"
 mix_report --turns || fail "the per-turn report for the mixed directory failed"
-assert_present "$MIX_HOME/data/token-reports/mate-mixed.turns.json" "per-turn report file"
+TURN_REPORT="$MIX_HOME/data/token-reports/mate-mixed.turns.json"
+assert_present "$TURN_REPORT" "per-turn report file"
 CH_ERR="$TMP_ROOT/mixed-charts-err.txt"
 CH_OUT=$(FM_HOME="$MIX_HOME" FM_DATA_OVERRIDE="$MIX_HOME/data" "$CHARTS" 2>"$CH_ERR") \
-  || fail "charts must still render when a per-turn report shares the directory: $(cat "$CH_ERR")"
-assert_present "$CH_OUT" "charts page rendered beside a per-turn report"
-grep -qF 'mate-mixed.turns.json' "$CH_ERR" \
-  || fail "a skipped report must be named on stderr, never dropped silently"
-# With only the unrenderable shape present, the refusal must name the cause.
-rm -f "$MIX_HOME/data/token-reports/mate-mixed.json" "$CH_OUT"
+  || fail "charts must render both report shapes from one directory: $(cat "$CH_ERR")"
+assert_present "$CH_OUT" "charts page rendered from both report shapes"
+MIX_HTML=$(cat "$CH_OUT")
+assert_contains "$MIX_HTML" "context size vs call index" \
+  "the per-task charts must still be drawn"
+assert_contains "$MIX_HTML" "marginal theo từng turn" \
+  "the per-turn view must be drawn from the turn report in the same directory"
+assert_not_contains "$MIX_HTML" "<script" "charts must still render without scripts"
+assert_not_contains "$MIX_HTML" "http://" "charts must stay self-contained"
+# The rendered per-turn totals are the report's own, not a re-sum of its rows.
+TURN_CALLS=$(jq -r '.totals.calls' "$TURN_REPORT")
+assert_contains "$MIX_HTML" "$TURN_CALLS model call" \
+  "the per-turn view must print the turn report's own call count"
+
+# A file this renderer cannot draw is announced by name; being skipped silently
+# would make an undrawn report look like a drawn one.
+printf '%s\n' '{"schema":"some-other.v9"}' > "$MIX_HOME/data/token-reports/foreign.json"
+printf 'not json at all\n' > "$MIX_HOME/data/token-reports/broken.json"
+FM_HOME="$MIX_HOME" FM_DATA_OVERRIDE="$MIX_HOME/data" "$CHARTS" >/dev/null 2>"$CH_ERR" \
+  || fail "charts must still render the shapes it knows: $(cat "$CH_ERR")"
+grep -qF 'foreign.json' "$CH_ERR" \
+  || fail "a report of an unknown schema must be named on stderr"
+grep -qF 'broken.json' "$CH_ERR" \
+  || fail "an unreadable report must be named on stderr"
+
+# With nothing renderable left, the refusal names the cause instead of writing
+# an empty page.
+rm -f "$MIX_HOME/data/token-reports/mate-mixed.json" "$TURN_REPORT" "$CH_OUT"
 if FM_HOME="$MIX_HOME" FM_DATA_OVERRIDE="$MIX_HOME/data" "$CHARTS" >/dev/null 2>"$CH_ERR"; then
-  fail "charts must refuse when no per-task report remains, rather than rendering an empty page"
+  fail "charts must refuse when no renderable report remains, rather than rendering an empty page"
 fi
-grep -q 'no per-task reports to render' "$CH_ERR" \
+grep -q 'no renderable reports' "$CH_ERR" \
   || fail "the refusal must say what was missing, got: $(cat "$CH_ERR")"
-pass "charts render the per-task shape only, and name every report they leave behind"
+pass "charts draw each report by the schema it declares, and name every one they leave behind"
+
+# --- the per-turn view keeps the never-estimate rule --------------------------
+#
+# A turn whose marginal the ledger could not supply must be OMITTED and counted,
+# never drawn at zero, and calls that fit no turn must be reported rather than
+# folded into a neighbour.
+HOLE_DIR="$TMP_ROOT/turn-holes/token-reports"
+mkdir -p "$HOLE_DIR"
+cat > "$HOLE_DIR/holes.json" <<'JSON'
+{
+  "schema": "fm-token-turn-report.v1",
+  "generated": "2026-08-14T00:00:00Z",
+  "report_id": "holes",
+  "identity": { "harness_observed": "claude", "sessions": ["s1"],
+                "started": "2026-08-14T00:00:00Z", "finished": "2026-08-14T00:30:00Z" },
+  "totals": { "turns": 2, "turns_with_unknown_index": 1, "calls": 3,
+              "naive_log_record_count": 4, "marginal_tokens": 120,
+              "cache_read_tokens": 300, "output_tokens": 40, "gross_tokens": 460 },
+  "turns": [
+    { "turn_index": 1, "trigger_kind": "captain", "wake_kind": "none",
+      "task_ids": [], "task_bucket": "unattributed",
+      "trigger_class": "captain-interaction", "calls": 2, "marginal_tokens": 120,
+      "cache_read_tokens": 300, "output_tokens": 40, "gross_tokens": 460 },
+    { "turn_index": "unknown", "trigger_kind": "wake", "wake_kind": "stale",
+      "task_ids": [], "task_bucket": "unattributed",
+      "trigger_class": "wake-handling", "calls": 1, "marginal_tokens": "unknown",
+      "cache_read_tokens": "unknown", "output_tokens": "unknown", "gross_tokens": "unknown" }
+  ],
+  "by_trigger_class": [
+    { "key": "captain-interaction", "turns": 1, "calls": 2, "marginal_tokens": 120,
+      "cache_read_tokens": 300, "output_tokens": 40, "gross_tokens": 460 }
+  ],
+  "by_wake_kind": [],
+  "by_task": [ { "key": "unattributed", "turns": 2, "calls": 3,
+                 "marginal_tokens": "unknown", "cache_read_tokens": "unknown",
+                 "output_tokens": "unknown", "gross_tokens": "unknown" } ],
+  "by_task_note": "unattributed is a MEASURED result and is never redistributed.",
+  "turn_attribution": { "rules": "bin/fm-token-ledger.sh --turn-rules",
+                        "calls_without_turn": 2,
+                        "calls_without_turn_note": "they keep their own unknown bucket." }
+}
+JSON
+HOLE_OUT="$TMP_ROOT/turn-holes.html"
+"$CHARTS" --out "$HOLE_OUT" "$HOLE_DIR/holes.json" >/dev/null 2>&1 \
+  || fail "the per-turn view must render a report that carries unknowns"
+HOLE_HTML=$(cat "$HOLE_OUT")
+assert_contains "$HOLE_HTML" "1 turn bị bỏ qua" \
+  "a turn whose marginal is unknown must be omitted and the omission counted"
+assert_contains "$HOLE_HTML" "unknown" \
+  "an unknown rollup figure must be printed as unknown, never as a number"
+assert_contains "$HOLE_HTML" "2 model call không xếp được vào turn nào" \
+  "calls the ledger could not place in a turn must be reported, not folded away"
+assert_contains "$HOLE_HTML" "1 turn không có chỉ số turn" \
+  "a turn with no index in the log must be reported as such"
+assert_not_contains "$HOLE_HTML" ">0<" \
+  "an unknown figure must never be rendered as 0"
+pass "the per-turn view omits and labels what the report calls unknown"
+
+# A wake-handling rollup whose marginal the ledger could not supply must not be
+# read as "wake cost nothing": the verdict states the gap instead of drawing a
+# measured 0% conclusion from an unknown.
+WHOLE_DIR="$TMP_ROOT/turn-wake-hole/token-reports"
+mkdir -p "$WHOLE_DIR"
+jq '.by_trigger_class += [ { "key": "wake-handling", "turns": 1, "calls": 1,
+      "marginal_tokens": "unknown", "cache_read_tokens": "unknown",
+      "output_tokens": "unknown", "gross_tokens": "unknown" } ]' \
+  "$HOLE_DIR/holes.json" > "$WHOLE_DIR/wakehole.json" \
+  || fail "the wake-hole fixture must be derivable from the holes report"
+WHOLE_OUT="$TMP_ROOT/turn-wake-hole.html"
+"$CHARTS" --out "$WHOLE_OUT" "$WHOLE_DIR/wakehole.json" >/dev/null 2>&1 \
+  || fail "the per-turn view must render a report whose wake rollup is unknown"
+WHOLE_HTML=$(cat "$WHOLE_OUT")
+assert_not_contains "$WHOLE_HTML" "Xử lý wake chiếm" \
+  "an unknown wake marginal must not be turned into a measured share of the session"
+assert_contains "$WHOLE_HTML" "chi phí biên của nhóm xử lý wake không đo được" \
+  "the verdict must state that the wake rollup was not measured"
+assert_contains "$WHOLE_HTML" "1 nhóm bị bỏ qua" \
+  "the unmeasured trigger-class group must be counted as omitted"
+pass "an unknown wake rollup is stated as unmeasured, never interpolated as 0%"
+
+# --- page framing flags: title, back-link and self-reload ---------------------
+#
+# These exist so bin/fm-token-board.sh can produce per-task pages that are named,
+# link back to the overview, and reload while their task runs. The back-link must
+# stay a relative same-directory href, because the board is served as static
+# files from one directory.
+FRAME_OUT="$TMP_ROOT/framed.html"
+"$CHARTS" --out "$FRAME_OUT" --title "task-x burn" --back index.html --refresh 30 \
+  "$HOLE_DIR/holes.json" >/dev/null 2>&1 || fail "the framing flags must be accepted"
+FRAME_HTML=$(cat "$FRAME_OUT")
+assert_contains "$FRAME_HTML" "<title>task-x burn</title>" "--title must name the page"
+assert_contains "$FRAME_HTML" 'href="index.html"' "--back must render a relative back-link"
+assert_contains "$FRAME_HTML" '<meta http-equiv="refresh" content="30">' \
+  "--refresh must make the page reload itself"
+assert_not_contains "$FRAME_HTML" "<script" "a reloading page must still carry no scripts"
+for bad in /abs/index.html https://example.invalid/x 'javascript:alert(1)'; do
+  if "$CHARTS" --out "$TMP_ROOT/rejected.html" --back "$bad" "$HOLE_DIR/holes.json" \
+    >/dev/null 2>&1; then
+    fail "--back must refuse '$bad', which would not resolve as a static sibling"
+  fi
+done
+assert_absent "$TMP_ROOT/rejected.html" "a refused back-link must write no page"
+"$CHARTS" --out "$TMP_ROOT/norefresh.html" "$HOLE_DIR/holes.json" >/dev/null 2>&1 \
+  || fail "rendering without the framing flags must still work"
+assert_not_contains "$(cat "$TMP_ROOT/norefresh.html")" "http-equiv" \
+  "a page rendered without --refresh must not reload"
+pass "the page framing flags are additive: named, linked and reloading, or none of it"
 
 printf 'ok - all fm-token-baseline behavior tests passed\n'

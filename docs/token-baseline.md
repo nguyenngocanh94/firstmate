@@ -5,19 +5,20 @@ How Firstmate measures what a task actually cost in tokens.
 This is **measurement only**.
 Nothing in this surface changes prompts, context, tool configuration, orchestration, or how work runs; the baseline exists to describe the system as it is, so any later change has something honest to be compared against.
 
-The three tools form one chain, and each layer reads only the layer below it:
+The tools form one chain, and each layer reads only the layer below it:
 
 | Tool | Reads | Writes |
 | --- | --- | --- |
 | [`bin/fm-token-ledger.sh`](../bin/fm-token-ledger.sh) | a raw agent session log | one JSON record per model call, on stdout |
 | [`bin/fm-token-report.sh`](../bin/fm-token-report.sh) | a ledger | one report at `data/token-reports/<task-id>.json`, or the per-turn session report at `<task-id>.turns.json` with `--turns` |
 | [`bin/fm-token-charts.sh`](../bin/fm-token-charts.sh) | reports | one self-contained HTML page |
+| [`bin/fm-token-board.sh`](../bin/fm-token-board.sh) | [`bin/fm-token-usage.sh`](../bin/fm-token-usage.sh) plus reports, rendered through the charts tool | the fleet board at `data/token-board/` |
 
-A report is never computed by re-parsing a log, and a chart is never drawn from anything but a report.
+A report is never computed by re-parsing a log, a chart is never drawn from anything but a report, and the board never opens a log or a ledger at all.
 That is what makes every figure traceable back to a logged field.
 Exact flags and mechanics live in each script's header and `--help`, which own them.
 
-Reports and charts land under the operational home's private, gitignored `data/token-reports/`.
+Reports, charts and the board land under the operational home's private, gitignored `data/`.
 They contain fleet telemetry - task ids, project names, PR urls, burn - so they are deliberately not written to a tracked location.
 
 ## The two rules that shape everything here
@@ -164,8 +165,8 @@ Three of those rules carry the measurement contract into this surface.
 Per turn the report gives model calls, marginal tokens (the uncached input a turn actually added), cache read, output and gross tokens, alongside `calls` and `naive_log_record_count` exactly as the per-task report does.
 It then rolls those up per trigger kind, per wake kind, per task bucket, and per trigger class - captain interaction, wake handling, and overhead.
 
-Both report shapes land in the same private directory, and [`bin/fm-token-charts.sh`](../bin/fm-token-charts.sh) renders the per-task shape only.
-It admits a file by the schema the file declares and names any report it skips on stderr, so a report that was written but not drawn is never mistaken for one that was.
+Both report shapes land in the same private directory, and [`bin/fm-token-charts.sh`](../bin/fm-token-charts.sh) draws each of them by the schema the file declares: the four baseline charts its header enumerates for a per-task report, and the per-turn view - marginal share by trigger class, marginal per turn with its trigger label, and the wake-kind and task-bucket rollups - for a turn report.
+It admits a file only when it recognises that schema and names any report it skips on stderr, so a report that was written but not drawn is never mistaken for one that was.
 
 Turn segmentation is implemented for claude only.
 The other runtimes declare `turn_index` and `turn_trigger` under `not_implemented` in `--capabilities`, which is a distinct claim from `cannot`: `cannot` is a limit of the runtime's log, `not_implemented` is a gap in this tool, and guessing at another runtime's turn shape would fabricate attribution.
@@ -212,6 +213,38 @@ The two now also share the requestId call-grouping itself, via [`bin/fm-token-de
 The inflation ratio is not constant: it depends on how many content blocks each session's responses happened to have, so it varies per session and does not cancel out in a fleet aggregate (measured 1.68x on the real fleet's last 24h of Claude usage on 2026-08-12: 600,483,593 naive tokens versus 357,635,568 deduped tokens over the same window, 1,583 real calls versus 2,744 raw log records).
 `data/token-reports/` is unaffected: it comes from the ledger, which has grouped by requestId since it was introduced.
 Old daily snapshots are never rewritten automatically; do not compare them against a total produced after this change without accounting for the inflation.
+
+## The fleet board
+
+[`bin/fm-token-board.sh`](../bin/fm-token-board.sh) is the reading end of the whole chain: a continuously updating overview of burn per mate and per task, where every task row opens that task's own page.
+
+It adds no measurement of its own, and that is the point of it existing as a separate tool.
+Fleet and per-source numbers come from `fm-token-usage.sh --json`, which already owns attribution and the requestId dedup behind every total.
+Per-task and per-turn detail comes from the reports in `data/token-reports/`, read by the schema each one declares.
+Every page is rendered by `fm-token-charts.sh`.
+The board opens no session log and re-derives no total, so a figure on the board is the same figure the layer below it published.
+
+Four properties are worth stating because they are what make the board usable rather than merely present.
+
+**Marginal is kept apart from cache read, everywhere.**
+Uncached input - what a call actually added - and cache read - the context re-sent and re-read on every call - are drawn as separate segments and reported as separate numbers.
+On the measured fleet cache read is roughly two orders of magnitude larger, so collapsing the two into one headline would hide the only one of them that context work can move.
+
+**A running task is measured while it runs.**
+`fm-token-report.sh --task` works mid-task, so each tick refreshes the snapshot of every task that still holds a runtime record, and that task's page reloads itself.
+A finished task's page is final and is not re-rendered while its report is unchanged.
+
+**Liveness is local, and says so.**
+Fleet burn covers every registered home, but whether a task is still running is read from this home's own runtime records and reports.
+A task owned by a secondmate home therefore appears with its burn and no status, and the board renders that as "not visible from this home" rather than calling it finished - the same rule as unknown totals, which stay unknown.
+Full cross-home live-task visibility is a follow-up, not a silent gap.
+
+**It stops honestly.**
+The board is generated by a plain loop the captain or firstmate starts - no daemon, no port, no watcher integration - and its pages carry a loud stale banner that fires once the feed stops advancing for several loop intervals, naming the age and the command that restarts the loop.
+Budget alarms remain `fm-token-usage.sh --check`'s job; the board displays a budget gauge and never raises anything.
+
+The generated pages and their data feed are private fleet telemetry under `data/token-board/`, exactly like the reports they read.
+The arm command, the per-tick cost bound, and every flag live in the script's own header and `--help`.
 
 ## Maintaining this file
 
