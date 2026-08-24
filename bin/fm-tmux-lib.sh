@@ -66,9 +66,19 @@
 # shellcheck source=bin/fm-composer-lib.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/fm-composer-lib.sh"
 
+# Sourced for ONE value: FM_BUSY_GROK_TAIL_REGEX_DEFAULT, Grok's verified
+# mid-turn signature. Grok's markers are a single vendor fact, so keeping a
+# second literal copy of them here is exactly the duplication that let the
+# delivery guard and the task-state classifier drift onto different releases.
+# Nothing else from that library is used here, and this file is still NOT a
+# task-state source; bin/fm-busy-lib.sh remains the sole owner of that contract
+# and sources nothing itself, so this edge cannot cycle.
+# shellcheck source=bin/fm-busy-lib.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/fm-busy-lib.sh"
+
 # Delivery-only rendered busy footers per harness. claude/codex: "esc to
-# interrupt"; opencode: "esc interrupt"; pi: "Working..."; grok: "Ctrl+c:cancel";
-# agy: "esc to cancel".
+# interrupt"; opencode: "esc interrupt"; pi: "Working..."; grok: "Esc:cancel"
+# on 1.0.x and "Ctrl+c:cancel" on 0.2.x; agy: "esc to cancel".
 # Claude's current spinner has a rotating glyph and word, but every active-turn
 # line has an ellipsis followed by a parenthesized elapsed duration. Keep this
 # signature separate from the shared default because that shape is not generic
@@ -87,12 +97,18 @@
 # "? for shortcuts". The token is ASCII and stable across thinking and tool
 # execution, so unlike Kimi's spinner it also joins the shared default used for a
 # pane whose harness is unknown.
-FM_TMUX_BUSY_REGEX_DEFAULT='esc (to )?interrupt|esc to cancel|Working\.\.\.|Ctrl\+c:cancel'
+# Grok contributes BOTH of its footer cancel tokens to the shared default, because
+# an unknown-harness pane that is really grok 1.0.x mid-turn must not read idle to
+# the away-mode injector. Its other verified signal, a bracketed "[stop]" ending
+# the live status row, stays scoped to the grok signature below: end-anchored or
+# not, a lone bracketed word is too generic to attribute to an unidentified
+# harness, the same reason Claude's ellipsis-plus-elapsed shape is kept out.
+FM_TMUX_BUSY_REGEX_DEFAULT='esc (to )?interrupt|esc to cancel|Working\.\.\.|Ctrl\+c:cancel|Esc:cancel'
 FM_TMUX_CLAUDE_BUSY_REGEX_DEFAULT='esc to interrupt|…[[:space:]]+\([0-9]+[smh]'
 FM_TMUX_CODEX_BUSY_REGEX_DEFAULT='esc to interrupt'
 FM_TMUX_OPENCODE_BUSY_REGEX_DEFAULT='esc interrupt'
 FM_TMUX_PI_BUSY_REGEX_DEFAULT='Working\.\.\.'
-FM_TMUX_GROK_BUSY_REGEX_DEFAULT='Ctrl\+c:cancel'
+FM_TMUX_GROK_BUSY_REGEX_DEFAULT=$FM_BUSY_GROK_TAIL_REGEX_DEFAULT
 FM_TMUX_KIMI_BUSY_REGEX_DEFAULT='^[[:space:]]*(🌑|🌒|🌓|🌔|🌕|🌖|🌗|🌘)[[:space:]]+·[[:space:]]+'
 FM_TMUX_AGY_BUSY_REGEX_DEFAULT='esc to cancel'
 

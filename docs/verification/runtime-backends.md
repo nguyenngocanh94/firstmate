@@ -75,6 +75,9 @@ Run the live guard after any harness upgrade and before trusting or refreshing t
 FM_HARNESS_LIVENESS_DRIFT=1 bin/fm-test-run.sh tests/fm-harness-liveness-drift-live-e2e.test.sh
 ```
 
+Process identity is one of two rendered-surface classes read through this backend; the other is each harness's busy footer.
+That one has its own drift guard (`FM_HARNESS_BUSY_DRIFT=1 bin/fm-test-run.sh tests/fm-harness-busy-drift-live-e2e.test.sh`) and its evidence is owned by [`supervision.md`](supervision.md), not restated here.
+
 Bounded output from the run that produced the table:
 
 ```text
