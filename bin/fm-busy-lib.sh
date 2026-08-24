@@ -250,13 +250,45 @@ fm_busy_record_read() {  # <state-dir> <id>
   printf '%s %s %s %s' "$r_state" "$r_source" "$r_event" "$r_seq"
 }
 
+# FM_BUSY_GROK_TAIL_REGEX_DEFAULT: the verified Grok task-state busy signature,
+# defined HERE because this file is the one owner of the busy contract and the
+# only one of the two libraries every classifier consumer sources - bin/fm-watch.sh
+# sources this file WITHOUT bin/fm-tmux-lib.sh, so a signature that lived only in
+# the tmux delivery-guard table left the watcher matching a private copy.
+#
+# It is the union of each installed version family's verified mid-turn markers,
+# and it deliberately carries TWO independent Grok 1.0.x signals so no single
+# vendor string is load-bearing:
+#   Ctrl+c:cancel   grok 0.2.x mid-turn footer. Verified 2026-06-29 on 0.2.73 and
+#                   retained from that evidence; grok 1.0.5 never prints it.
+#   Esc:cancel      grok 1.0.x mid-turn footer keybind. Verified 2026-08-24 on
+#                   1.0.5: the bar reads "Shift+Tab:mode | Esc:cancel |
+#                   Ctrl+.:shortcuts" while a turn runs and drops the cancel entry
+#                   to "Shift+Tab:mode | Ctrl+.:shortcuts" the moment it settles.
+#   [stop] at EOL   grok 1.0.x active-turn stop control, the last token of the live
+#                   status row. Verified 2026-08-24 on 1.0.5 as the only place the
+#                   bracketed form appears; the settled turn summary prints a bare
+#                   "stop  [hooks: 2]" instead, which this does not match.
+# The two 1.0.x signals agreed on all 193 captured frames, so either can carry the
+# verdict alone if a release renames the other.
+# A spinner-row "<label>… <elapsed>s" shape was REJECTED as a signal: during tool
+# execution grok renders "Run Write `file` 0.0s" with no ellipsis, so that shape
+# goes dark for exactly as long as a tool call runs (captured in
+# tests/fixtures/harness-busy-tails/grok-1.0.5/busy-tool-call.pane). The braille
+# spinner glyph itself is rejected as locale- and font-sensitive, matching the
+# reason Kimi's moon-phase spinner is not a state source either.
+# docs/verification/supervision.md owns the dated evidence, and
+# tests/fm-harness-busy-drift-live-e2e.test.sh re-checks it against every
+# installed harness after an upgrade.
+FM_BUSY_GROK_TAIL_REGEX_DEFAULT='Ctrl\+c:cancel|Esc:cancel|\[stop\][[:space:]]*$'
+
 # fm_busy_grok_tail_busy: the Grok-only temporary rendered-tail fallback.
 # Consumes the tail on stdin; 0 when Grok's verified busy signature matches.
 # FM_BUSY_REGEX still globally overrides the signature, mirroring the
 # historical operator escape hatch.
 fm_busy_grok_tail_busy() {
   grep -v '^[[:space:]]*$' | tail -12 \
-    | grep -qiE "${FM_BUSY_REGEX:-${FM_TMUX_GROK_BUSY_REGEX_DEFAULT:-Ctrl\\+c:cancel}}"
+    | grep -qiE "${FM_BUSY_REGEX:-$FM_BUSY_GROK_TAIL_REGEX_DEFAULT}"
 }
 
 # fm_busy_classify: semantic classification for a task whose endpoint the

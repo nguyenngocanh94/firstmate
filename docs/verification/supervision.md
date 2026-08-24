@@ -72,8 +72,94 @@ Each pass polled `state/<id>.busy-state` while a real turn ran.
 | Claude | 2.1.220 (Claude Code) | Hooks `UserPromptSubmit`, `Stop`, `StopFailure`, `SessionEnd` | `UserPromptSubmit` fired for the argv launch prompt and each steer, and `Stop` closed every completed turn. A mid-stream Escape interrupt fired no closing hook, which is why the firstmate-controlled clear exists. `StopFailure` and `SessionEnd` are wired from the four hook names present in the installed binary; only the abnormal paths they cover were not reproduced live. |
 | Codex | codex-cli 0.145.0 | None usable | See below; classifies `unknown codex-unverified`. |
 | Kimi (standalone) | not installed | None usable | No binary on `PATH`, so the gate stays closed and it classifies `unknown kimi-unverified`. |
-| Grok | 0.2.112 | Isolated rendered-tail fallback | Retained unconverted; the approved audit could not credit a live structured-lifecycle run. |
+| Grok | 1.0.5 | Isolated rendered-tail fallback | Retained unconverted; the approved audit could not credit a live structured-lifecycle run. Its rendered signature was re-derived on 2026-08-24 - see below - after the 0.2.x signature was found to classify every working 1.0.x worker idle. |
 | agy | 1.1.10 | None usable | Probed 2026-08-04; see below. No semantic source and no turn-end hook, so it classifies `unknown missing` and `fm-spawn` arms no busy contract for it. |
+
+### Grok rendered busy signature
+
+Grok is the one adapter whose task state still comes from a rendered tail, so its signature is a vendor string that rots silently.
+It did: the default was `Ctrl+c:cancel`, grok 0.2.x's mid-turn keybind bar, and grok 1.0.5 never prints that string.
+Every actively working grok worker therefore classified idle, which is the harmful direction - an idle verdict is what lets stale detection escalate a healthy worker and what makes a pane eligible for the keystroke stall ladder.
+
+The signature was re-derived on 2026-08-24 against `grok 1.0.5 (5115b46bc909) [stable]`, on private tmux sockets inside throwaway git workspaces, capturing with the same primitive the classifier consumes:
+
+```sh
+tmux -L "$socket" new-session -d -s probe -x 200 -y 50 -c "$wt" "grok --always-approve"
+tmux -L "$socket" capture-pane -p -t probe -S -40
+```
+
+Three runs were captured: a bare never-prompted launch held idle for 24s; a long tool-using turn sampled every 2s from submit through settle; and a `grok --always-approve "<prompt>"` positional launch, the shape `fm-spawn` uses, sampled every 0.5s from process start through settle.
+That is 193 frames, 38 with a turn genuinely running and 155 without.
+
+Exactly four keybind-bar shapes appeared, and only the first has a turn running:
+
+```text
+  Shift+Tab:mode  │  Esc:cancel  │  Ctrl+.:shortcuts        turn running
+  Shift+Tab:mode  │  Ctrl+.:shortcuts                       turn settled
+  Shift+Tab:mode  │  Ctrl+;:queue  │  Ctrl+.:shortcuts      launched, prompt still queued
+  Enter:send  │  Shift+Tab:mode  │  Ctrl+.:shortcuts         turn cancelled, prompt restored
+```
+
+A bare never-prompted launch renders no keybind bar at all.
+`Ctrl+c:cancel` appeared in none of the 193 frames, in either state.
+
+Two independent ASCII signals were confirmed busy-only, and they agreed on all 193 frames:
+
+```text
+  Esc:cancel                     footer cancel keybind
+  [stop] ending the status row   active-turn stop control
+```
+
+The live status row is `⠹ Responding… 5.4s   15s ⇣16.9k [stop]`, and `[stop]` ended the line in all 38 busy frames with no trailing whitespace.
+The settled turn prints `Worked for 1m17s   stop  [hooks: 2]` instead, so only the bracketed form is a signal.
+
+Two candidate signals were rejected:
+
+- The `<label>… <elapsed>s` spinner shape. During tool execution grok renders `⠸ Run Write \`notes.md\` 0.0s` with no ellipsis, so the shape goes dark for exactly as long as a tool call runs. One captured frame proves it while both retained signals still held.
+- The braille spinner glyph itself, as locale- and font-sensitive, the same reason Kimi's moon-phase spinner is not a state source.
+
+Interrupt behavior changed in the same release and was verified in the same pass.
+On 1.0.5 a single `Ctrl+C` and a single `Esc` each cancel the running turn, and each restores the cancelled prompt into the composer as unsubmitted text; on 0.2.x `Esc` only moved focus to the scrollback.
+An interrupted grok pane therefore reads idle with pending composer content, and anything typed next appends to the restored text.
+
+The frames are committed verbatim under [`tests/fixtures/harness-busy-tails/grok-1.0.5/`](../../tests/fixtures/harness-busy-tails/grok-1.0.5/) and asserted in both directions by [`tests/fm-grok-busy-tail.test.sh`](../../tests/fm-grok-busy-tail.test.sh).
+Refresh this record by re-running the live drift guard, which re-captures fresh frames from every installed harness and fails naming the harness and version:
+
+```sh
+FM_HARNESS_BUSY_DRIFT=1 tests/fm-harness-busy-drift-live-e2e.test.sh
+```
+
+Bounded output from the 2026-08-24 run, on the installed set:
+
+```text
+ok - busy signature: claude 2.1.241 (Claude Code) reads idle at rest and busy during a real turn
+ok - busy signature: opencode 1.18.15 reads idle at rest and busy during a real turn
+ok - busy signature: pi 0.84.2 reads idle at rest and busy during a real turn
+ok - busy signature: grok grok 1.0.5 (5115b46bc909) [stable] reads idle at rest and busy during a real turn
+# fully checked 4 installed harness(es) in both directions
+```
+
+Every other installed signature was also checked, because grok's rot could not have been the only instance: every harness on this machine is a newer release than the version its signature was recorded against.
+The result is that grok was the only broken one.
+
+| Harness | Version installed | Version previously recorded | Rendered busy signature | Result |
+| --- | --- | --- | --- | --- |
+| claude | 2.1.241 | 2.1.220 | `esc to interrupt` or `…` plus a parenthesized elapsed duration | Current. Matched 155 of 160 frames of a long turn as `✢ Discombobulating… (10s · thinking with medium effort)`. |
+| codex | 0.149.1 | 0.145.0 | `esc to interrupt` | Current. Captured directly as `• Working (3s • esc to interrupt)`. |
+| opencode | 1.18.15 | 1.17.18 | `esc interrupt` | Current; the live guard established both directions. |
+| pi | 0.84.2 | 0.82.0 | `Working...` | Current; the live guard established both directions. |
+| grok | 1.0.5 | 0.2.112 | was `Ctrl+c:cancel` | BROKEN, re-derived above. |
+| agy | 1.1.19 | 1.1.10 | `esc to cancel` | Current. Captured directly across 11 mid-turn frames, settling to `? for shortcuts`. |
+| kimi, pi-signed | not installed | - | - | Unverified here; no binary to run. |
+
+Two limits of the rendered read itself, distinct from any one signature, were observed in the same pass and are not defects in the expressions:
+
+- A harness whose status row only grows the matched part after a second or two is unmatched until then. claude renders a bare `✢ Effecting…` before it renders the elapsed form, so a turn that finishes inside that window never reads busy. The live guard therefore uses a deliberately long-running prompt; a trivial one makes a working signature look broken.
+- Fast streaming output can push the status row past the last twelve non-blank lines the classifiers read, so claude and codex both show transient idle frames mid-turn. Their task state comes from semantic records rather than the tail, so this bounds the delivery guards only.
+
+Two further observations from the same pass are recorded as leads, not as verified wiring.
+grok 1.0.5's own transcript renders `◆ user_prompt_submit  [hooks: 1]` when a turn opens and `stop  [hooks: 2]` when it closes, so the release does execute the `UserPromptSubmit`/`Stop` pair that Claude's semantic busy source is built on; the observed registration was a third party's global hook, and no firstmate-owned payload was verified, so the Grok gate stays closed and the rendered fallback stands.
+An empty grok 1.0.5 composer also renders as a bare `❯` with no placeholder, so the `Type a message...` idle-placeholder override in the herdr, orca, and cmux adapters no longer matches for grok; it is inert rather than unsafe, because the shared classifier already reads a bare `❯` as an empty agent composer.
 
 Codex was probed two ways, both refused:
 

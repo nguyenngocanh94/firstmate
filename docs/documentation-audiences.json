@@ -371,6 +371,10 @@
     {
       "path": "skills/stow/SKILL.md",
       "audience": "public-product"
+    },
+    {
+      "path": "tests/fixtures/harness-busy-tails/README.md",
+      "audience": "maintainer-verification"
     }
   ]
 }
