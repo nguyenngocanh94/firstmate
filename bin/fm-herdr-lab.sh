@@ -14,7 +14,8 @@
 # The name command sanitizes the label, caps it at 16 characters, and appends
 # process/random suffixes to keep generated socket paths short.
 # Every Herdr call made here carries a trailing --session <session>.
-# The run command rejects caller-supplied --session flags, any leading option
+# The run command rejects caller-supplied --session flags, a bare -- that
+# would turn the trailing --session into literal text, any leading option
 # before the subcommand, all session lifecycle operations, and every server
 # operation.
 # Session stop is available only through guarded stop or teardown, and session
@@ -48,6 +49,16 @@ fm_herdr_lab_tripwire_path() { # <session>
   printf '%s/%s.fleet-state.json' "$(fm_herdr_lab_state_dir)" "$1"
 }
 
+# Isolation is the trailing --session flag, not HERDR_SESSION. A caller
+# bare -- makes later tokens operands, so fm_herdr_lab_cli refuses --
+# before this call. Behaviour after a bare -- is argv-shape-dependent and
+# has been observed reaching the live default session: on herdr 0.7.5,
+# pane send-text w1:p1 -- MARK still selected the lab while the helper's
+# trailing --session pair was delivered as pane text, while the M4 probe's
+# pane send-text w1:p1 -- MARK --session <lab> was answered by default
+# (nothing was written only because that pane id does not exist there,
+# which is luck, not a guard). HERDR_SESSION is not a fallback, and no
+# shape of it may be relied on.
 fm_herdr_lab_raw() { # <session> <herdr arguments...>
   local name=$1
   shift
@@ -133,6 +144,10 @@ fm_herdr_lab_cli() { # <session> <herdr arguments...>
   esac
   for arg in "$@"; do
     case "$arg" in
+      --)
+        fm_herdr_lab_error "run forbids a bare --; it would turn the trailing --session into literal text and drop lab isolation"
+        return 1
+        ;;
       --session|--session=*)
         fm_herdr_lab_error "run forbids caller-supplied --session; the helper appends the lab session"
         return 1
