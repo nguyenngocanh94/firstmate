@@ -86,6 +86,50 @@ run_with_fake() {
     "$@"
 }
 
+test_refuses_bare_double_dash() {
+  local name="fm-lab-dashdash-$$" status=0 before after err
+  : > "$FAKE_LOG"
+  err=$(mktemp "$TMP_ROOT/dashdash-err.XXXXXX")
+  before=$(wc -l < "$FAKE_LOG" | tr -d ' ')
+
+  status=0
+  run_with_fake fm_herdr_lab_cli "$name" pane send-text w1:p1 -- MARK >/dev/null 2>"$err" || status=$?
+  expect_code 1 "$status" "a bare -- in pane send-text argv must be refused"
+  assert_grep "run forbids a bare --" "$err" "bare -- refusal must use the existing run-forbids error shape"
+  after=$(wc -l < "$FAKE_LOG" | tr -d ' ')
+  [ "$before" = "$after" ] || fail "bare -- in send-text reached Herdr instead of refusing before the call"
+
+  status=0
+  : > "$err"
+  run_with_fake fm_herdr_lab_cli "$name" pane send-keys w1:p1 -- enter >/dev/null 2>"$err" || status=$?
+  expect_code 1 "$status" "a bare -- in pane send-keys argv must be refused"
+  assert_grep "run forbids a bare --" "$err" "send-keys bare -- refusal must use the run-forbids error shape"
+
+  status=0
+  : > "$err"
+  run_with_fake fm_herdr_lab_cli "$name" pane run w1:p1 -- echo hi >/dev/null 2>"$err" || status=$?
+  expect_code 1 "$status" "a bare -- in pane run argv must be refused"
+
+  status=0
+  : > "$err"
+  run_with_fake fm_herdr_lab_cli "$name" pane rename w1:p1 -- newname >/dev/null 2>"$err" || status=$?
+  expect_code 1 "$status" "a bare -- in pane rename argv must be refused"
+
+  status=0
+  : > "$err"
+  run_with_fake fm_herdr_lab_cli "$name" agent prompt -- hello >/dev/null 2>"$err" || status=$?
+  expect_code 1 "$status" "a bare -- in agent prompt argv must be refused"
+
+  after=$(wc -l < "$FAKE_LOG" | tr -d ' ')
+  [ "$before" = "$after" ] || fail "a bare -- reached Herdr instead of refusing before any call"
+
+  run_with_fake fm_herdr_lab_cli "$name" pane send-text w1:p1 "MARK --session other" >/dev/null \
+    || fail "text containing --session without a bare -- token must still reach Herdr"
+  grep -F "pane send-text w1:p1 MARK --session other --session $name" "$FAKE_LOG" >/dev/null \
+    || fail "safe send-text did not reach the real fm_herdr_lab_cli entry point"
+  pass "fm-herdr-lab: a bare -- in caller argv is refused without contacting Herdr"
+}
+
 test_refuses_unsafe_names() {
   local status=0 generated
   fm_herdr_lab_validate_name default >/dev/null 2>&1 || status=$?
@@ -235,6 +279,7 @@ SH
 }
 
 test_refuses_unsafe_names
+test_refuses_bare_double_dash
 test_provision_run_and_guarded_teardown
 test_missing_tripwire_blocks_destruction
 test_changed_default_trips_after_teardown
