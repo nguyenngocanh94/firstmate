@@ -2142,7 +2142,6 @@ META_WINDOW=$T
     echo "projects=$SECONDMATE_PROJECTS"
   fi
 } > "$STATE/$ID.meta"
-[ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")
@@ -2207,13 +2206,33 @@ if [ -n "$SPAWN_TRACEPARENT" ]; then
   fi
 fi
 sleep 0.3
-spawn_send_literal "$T" "$LAUNCH"
-sleep 0.3
-if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
-  HERDR_PROJECTION_ABORT_CLEANUP=0
-  spawn_herdr_presentation_order_lock_release
+if [ "$BACKEND" = orca ]; then
+  # Orca can accept a write while swallowing the Enter that should submit it.
+  # Use the backend's real submit verifier for the launch brief itself, so a
+  # live terminal is never published when the harness command is still sitting
+  # in its composer.
+  ORCA_LAUNCH_RETRIES=${FM_ORCA_SPAWN_RETRIES:-3}
+  ORCA_LAUNCH_SLEEP=${FM_ORCA_SPAWN_SLEEP:-0.4}
+  ORCA_LAUNCH_VERDICT=$(fm_backend_send_text_submit \
+    "$BACKEND" "$T" "$LAUNCH" "$ORCA_LAUNCH_RETRIES" \
+    "$ORCA_LAUNCH_SLEEP" 0.3 "$W") || {
+    echo "error: Orca launch brief could not be submitted; inspect window $T" >&2
+    exit 1
+  }
+  if [ "$ORCA_LAUNCH_VERDICT" != empty ]; then
+    echo "error: Orca launch brief was not submitted (verdict=${ORCA_LAUNCH_VERDICT:-unknown}); inspect window $T" >&2
+    exit 1
+  fi
+else
+  spawn_send_literal "$T" "$LAUNCH"
+  sleep 0.3
+  if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
+    HERDR_PROJECTION_ABORT_CLEANUP=0
+    spawn_herdr_presentation_order_lock_release
+  fi
+  spawn_send_key "$T" Enter
 fi
-spawn_send_key "$T" Enter
+[ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 if [ "$HARNESS" = kimi ]; then
   if ! kimi_wait_for_ready; then
     kimi_spawn_fail "kimi did not show a verified ready signal before brief delivery"

@@ -112,6 +112,33 @@ fm_backend_orca_run_json() {
   printf '%s' "$out" | fm_backend_orca_json_ok
 }
 
+# Orca's JSON `ok=true` only proves that the request reached the runtime.
+# Terminal sends also carry result.send.accepted, which is the runtime's
+# admission verdict; an accepted=false response must never be treated as a
+# successful input operation.
+fm_backend_orca_run_send() {
+  local out accepted
+  out=$("$@") || return 1
+  printf '%s' "$out" | fm_backend_orca_json_ok || return 1
+  accepted=$(printf '%s' "$out" | node -e '
+const fs = require("fs");
+const input = fs.readFileSync(0, "utf8").trim();
+if (!input) process.exit(1);
+let data;
+try {
+  data = JSON.parse(input);
+} catch (err) {
+  console.error("invalid Orca send JSON: " + err.message);
+  process.exit(1);
+}
+const value = data.result && data.result.send && data.result.send.accepted;
+if (value === true) process.stdout.write("true");
+else if (value === false) process.stdout.write("false");
+else process.exit(1);
+') || return 1
+  [ "$accepted" = true ]
+}
+
 fm_backend_orca_repo_ensure() {  # <project-path>
   local project=$1 out repo_id
   fm_backend_orca_tool_check || return 1
@@ -168,13 +195,13 @@ fm_backend_orca_terminal_create() {  # <worktree-id> <title>
 fm_backend_orca_send_text_line() {  # <terminal-id> <text>
   local terminal=$1 text=$2
   fm_backend_orca_tool_check || return 1
-  fm_backend_orca_run_json orca terminal send --terminal "$terminal" --text "$text" --enter --json
+  fm_backend_orca_run_send orca terminal send --terminal "$terminal" --text "$text" --enter --json
 }
 
 fm_backend_orca_send_literal() {  # <terminal-id> <text>
   local terminal=$1 text=$2
   fm_backend_orca_tool_check || return 1
-  fm_backend_orca_run_json orca terminal send --terminal "$terminal" --text "$text" --json
+  fm_backend_orca_run_send orca terminal send --terminal "$terminal" --text "$text" --json
 }
 
 fm_backend_orca_remove_worktree() {  # <worktree-id>
@@ -239,7 +266,14 @@ let v = "";
 if (field === "limited") v = scalar(r.limited ?? term.limited);
 if (field === "oldestCursor") v = scalar(r.oldestCursor || term.oldestCursor);
 if (field === "nextCursor") v = scalar(r.nextCursor || term.nextCursor);
-if (field === "latestCursor") v = scalar(r.latestCursor || term.latestCursor);
+if (field === "latestCursor") v = scalar(r.latestCursor ?? term.latestCursor);
+if (field === "returnedLineCount") {
+  v = scalar(r.returnedLineCount ?? term.returnedLineCount);
+  if (!v && Array.isArray(term.tail)) v = String(term.tail.length);
+  if (!v && typeof (r.text || r.output || r.content || r.preview) === "string") {
+    v = (r.text || r.output || r.content || r.preview) ? "1" : "0";
+  }
+}
 if (!v) process.exit(1);
 process.stdout.write(v);
 ' "$field"
@@ -262,16 +296,23 @@ fm_backend_orca_read_text_paged() {  # <terminal-id> <limit>
   printf '%s' "$text"
 }
 
-FM_BACKEND_ORCA_COMPOSER_LINES=${FM_BACKEND_ORCA_COMPOSER_LINES:-200}
-FM_BACKEND_ORCA_IDLE_RE=${FM_BACKEND_ORCA_IDLE_RE:-'^Type a message\.\.\.$'}
+# Read one current Orca snapshot while retaining the cursor and render
+# metadata. Cursor progress is a protocol signal independent of the app's
+# unreliable screen projection, but an empty projection is never itself a
+# positive submit verdict.
+fm_backend_orca_read_snapshot() {  # <terminal-id> <limit>
+  local terminal=$1 limit=${2:-200} out
+  fm_backend_orca_tool_check || return 1
+  out=$(orca terminal read --terminal "$terminal" --limit "$limit" --json) || return 1
+  printf '%s' "$out" | fm_backend_orca_json_ok || return 1
+  FM_BACKEND_ORCA_SNAPSHOT_TEXT=$(fm_backend_orca_json_text "$out") || return 1
+  FM_BACKEND_ORCA_SNAPSHOT_NEXT=$(fm_backend_orca_json_field nextCursor "$out" 2>/dev/null \
+    || fm_backend_orca_json_field latestCursor "$out") || return 1
+  FM_BACKEND_ORCA_SNAPSHOT_LINES=$(fm_backend_orca_json_field returnedLineCount "$out" 2>/dev/null || true)
+}
 
-# fm_backend_orca_composer_state: classify the composer's own bordered row as
-# empty|pending|unknown. Real text stays pending, including a slash-command
-# popup that closed by filling an argument-hint placeholder into the composer;
-# that first Enter selected the popup item, it did not submit the command.
-fm_backend_orca_composer_state() {  # <terminal-id> -> empty|pending|unknown
-  local terminal=$1 cap line trimmed stripped="" found=0
-  cap=$(fm_backend_orca_read_text_paged "$terminal" "$FM_BACKEND_ORCA_COMPOSER_LINES") || { printf 'unknown'; return 0; }
+fm_backend_orca_composer_state_from_capture() {  # <capture> -> empty|pending|unknown
+  local cap=$1 line trimmed stripped="" found=0
   while IFS= read -r line; do
     trimmed="${line#"${line%%[![:space:]]*}"}"
     trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
@@ -295,15 +336,36 @@ fm_backend_orca_composer_state() {  # <terminal-id> -> empty|pending|unknown
   fm_composer_classify_content 1 "$stripped" "$FM_BACKEND_ORCA_IDLE_RE"
 }
 
+FM_BACKEND_ORCA_COMPOSER_LINES=${FM_BACKEND_ORCA_COMPOSER_LINES:-200}
+FM_BACKEND_ORCA_IDLE_RE=${FM_BACKEND_ORCA_IDLE_RE:-'^Type a message\.\.\.$'}
+
+# fm_backend_orca_composer_state: classify the composer's own bordered row as
+# empty|pending|unknown. Real text stays pending, including a slash-command
+# popup that closed by filling an argument-hint placeholder into the composer;
+# that first Enter selected the popup item, it did not submit the command.
+fm_backend_orca_composer_state() {  # <terminal-id> -> empty|pending|unknown
+  local terminal=$1 cap
+  cap=$(fm_backend_orca_read_text_paged "$terminal" "$FM_BACKEND_ORCA_COMPOSER_LINES") || { printf 'unknown'; return 0; }
+  fm_backend_orca_composer_state_from_capture "$cap"
+}
+
+fm_backend_orca_cursor_advanced() {  # <before> <after>
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  case "$1:$2" in
+    *[!0-9:]*) return 1 ;;
+  esac
+  [ "$2" -gt "$1" ]
+}
+
 fm_backend_orca_send_key() {  # <terminal-id> <key>
   local terminal=$1 key=$2
   fm_backend_orca_tool_check || return 1
   case "$key" in
     C-c|ctrl+c|Ctrl-c|Ctrl-C)
-      fm_backend_orca_run_json orca terminal send --terminal "$terminal" --interrupt --json
+      fm_backend_orca_run_send orca terminal send --terminal "$terminal" --interrupt --json
       ;;
     Enter|enter)
-      fm_backend_orca_run_json orca terminal send --terminal "$terminal" --text "" --enter --json
+      fm_backend_orca_run_send orca terminal send --terminal "$terminal" --text "" --enter --json
       ;;
     *)
       echo "error: unsupported Orca key '$key'" >&2
@@ -315,18 +377,63 @@ fm_backend_orca_send_key() {  # <terminal-id> <key>
 # fm_backend_orca_send_text_submit: type <text> once, then retry Enter until
 # the composer row reads empty. Retries send only Enter, so a slash-command
 # popup placeholder fill gets the required second Enter without duplicating text.
+# When the composer row cannot be found, a non-empty read with a cursor advance
+# after Enter is the separate Orca protocol evidence that the submit produced
+# terminal output. An empty render remains unknown and never means submitted.
 fm_backend_orca_send_text_submit() {  # <terminal-id> <text> <retries> <enter-sleep> <settle>
-  local terminal=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 i=0 state
+  local terminal=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 i=0 state baseline_cursor
   fm_backend_orca_tool_check || { printf 'send-failed'; return 0; }
   fm_backend_orca_send_literal "$terminal" "$text" || { printf 'send-failed'; return 0; }
   sleep "$settle"
+  baseline_cursor=
+  fm_backend_orca_read_snapshot "$terminal" "$FM_BACKEND_ORCA_COMPOSER_LINES" 2>/dev/null || true
+  baseline_cursor=${FM_BACKEND_ORCA_SNAPSHOT_NEXT:-}
   while :; do
-    fm_backend_orca_send_key "$terminal" Enter || true
+    if ! fm_backend_orca_send_key "$terminal" Enter; then
+      printf 'send-failed'
+      return 0
+    fi
     sleep "$sleep_s"
-    state=$(fm_backend_orca_composer_state "$terminal")
-    [ "$state" = pending ] || { printf '%s' "$state"; return 0; }
+    if ! fm_backend_orca_read_snapshot "$terminal" "$FM_BACKEND_ORCA_COMPOSER_LINES" 2>/dev/null; then
+      printf 'unknown'
+      return 0
+    fi
+    # An empty or unavailable render is not a clear composer. The line count
+    # check also rejects a response that only omitted the terminal payload.
+    case "${FM_BACKEND_ORCA_SNAPSHOT_LINES:-}" in
+      ''|*[!0-9]*|0)
+        printf 'unknown'
+        return 0
+        ;;
+    esac
+    [ -n "${FM_BACKEND_ORCA_SNAPSHOT_TEXT:-}" ] || {
+      printf 'unknown'
+      return 0
+    }
+    state=$(fm_backend_orca_composer_state_from_capture "$FM_BACKEND_ORCA_SNAPSHOT_TEXT")
+    case "$state" in
+      empty)
+        printf 'empty'
+        return 0
+        ;;
+      pending)
+        ;;
+      unknown)
+        if fm_backend_orca_cursor_advanced "$baseline_cursor" "${FM_BACKEND_ORCA_SNAPSHOT_NEXT:-}"; then
+          printf 'empty'
+          return 0
+        fi
+        printf 'unknown'
+        return 0
+        ;;
+      *)
+        printf 'unknown'
+        return 0
+        ;;
+    esac
     i=$((i + 1))
     [ "$i" -lt "$retries" ] || { printf 'pending'; return 0; }
+    baseline_cursor=${FM_BACKEND_ORCA_SNAPSHOT_NEXT:-$baseline_cursor}
   done
 }
 
