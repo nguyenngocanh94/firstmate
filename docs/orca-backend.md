@@ -45,11 +45,14 @@ worktree=<absolute Orca worktree path>
 
 ## Current lifecycle and safety
 
-Spawn registers the repository, creates an independent worktree, reuses only the verified `result.terminal.handle` returned by Orca or creates a terminal explicitly, installs harness hooks, records metadata, and launches the selected harness.
+Spawn registers the repository, creates an independent worktree, reuses only the verified `result.terminal.handle` returned by Orca or creates a terminal explicitly, installs harness hooks, verifies that the launch brief was submitted, records metadata, and launches the selected harness.
+A launch whose brief remains pending or cannot be verified is rejected before spawn completes.
 Exact command flags and response parsing are owned by `bin/backends/orca.sh` and script help.
 
 `fm-peek.sh` reads with `orca terminal read`.
-`fm-send.sh` types and verifies composer clearance, follows `oldestCursor` when Orca returns a limited page, and retries Enter without retyping when a slash popup first fills an argument placeholder.
+`fm-send.sh` types once, verifies the Orca send was accepted, and confirms either a structurally empty composer or cursor progress paired with a non-empty render after Enter.
+A pending composer is retried with Enter only, while an empty or unavailable render remains `unknown` and never counts as delivery.
+The verifier follows `oldestCursor` when Orca returns a limited page for structural composer reads.
 A bare shell row is `unknown`, not an empty agent composer.
 The watcher has no native Orca busy signal, so each harness adapter's semantic lifecycle supplies worker state.
 Grok alone retains its isolated rendered-tail fallback.
