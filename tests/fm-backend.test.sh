@@ -82,24 +82,18 @@ SH
   printf '%s\n' "$fb"
 }
 
-# The commit this branch started from - the P1 "current main" baseline.
-# Suitable for byte-identical old-vs-new checks while a branch still diverges
-# from main. After a squash lands, merge-base(HEAD, main) collapses to HEAD, so
-# callers that need a true pre-change fixture must not rely on this alone.
+# The parent of the runtime-backend extraction - the last pre-refactor baseline.
+# Once the extraction has landed on main, merge-base(HEAD, main) is the
+# refactored commit itself and no longer identifies the intended baseline.
 resolve_base_ref() {
-  local ref base
-  for ref in main refs/heads/main origin/main refs/remotes/origin/main origin/HEAD refs/remotes/origin/HEAD; do
-    if git -C "$ROOT" rev-parse --verify -q "$ref^{commit}" >/dev/null; then
-      base=$(git -C "$ROOT" merge-base HEAD "$ref" 2>/dev/null) || continue
-      [ -n "$base" ] || continue
-      printf '%s\n' "$base"
-      return 0
-    fi
-  done
-  return 1
+  local extraction parent
+  extraction=$(git -C "$ROOT" log --diff-filter=A --format='%H' -- bin/fm-backend.sh | tail -1) || return 1
+  [ -n "$extraction" ] || return 1
+  parent=$(git -C "$ROOT" rev-parse --verify "$extraction^" 2>/dev/null) || return 1
+  printf '%s\n' "$parent"
 }
 BASE_REF=$(resolve_base_ref) \
-  || fail "fm-backend baseline requires local main or origin/main; fetch the default branch before running this test"
+  || fail "fm-backend baseline requires the runtime-backend extraction history"
 
 # Newest first-parent revision whose bin/backends/tmux.sh still uses the
 # pre-exact permissive kill-window target. Content-addressed from history so the
@@ -141,7 +135,7 @@ resolve_permissive_tmux_kill_ref() {
 # hence the dispatcher is a copied sibling, while the tmux adapter is extracted
 # from BASE_REF so conformance tests retain the exact historical behavior even
 # when this branch changes tmux dispatch semantics.
-OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tasks-axi-lib.sh fm-pr-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-supervision-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-nm-run-lib.sh fm-decision-hold.sh fm-backend.sh fm-operational-input.sh fm-public-followup-lib.sh fm-secondmate-registry-lib.sh fm-secondmate-parent-lib.sh fm-x-lib.sh"
+OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tasks-axi-lib.sh fm-pr-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-busy-lib.sh fm-composer-lib.sh fm-path-identity-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-supervision-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-nm-run-lib.sh fm-decision-hold.sh fm-backend.sh fm-operational-input.sh fm-public-followup-lib.sh fm-secondmate-registry-lib.sh fm-secondmate-parent-lib.sh fm-x-lib.sh"
 # A pull-request merge may add a new main-only dependency that the branch's older baseline does not have yet.
 OLD_BIN_OPTIONAL_SIBLINGS="fm-pending-reply-lib.sh"
 OLD_BIN_REFACTORED="fm-send.sh fm-peek.sh fm-watch.sh fm-spawn.sh fm-teardown.sh fm-marker-lib.sh"
@@ -159,7 +153,9 @@ build_old_bin() {  # <name> -> echoes root dir (root/bin/<script> is the entry p
     cp "$ROOT/bin/$f" "$bin/$f"
   done
   cp -R "$ROOT/bin/backends" "$bin/backends"
-  git -C "$ROOT" show "$BASE_REF:bin/backends/tmux.sh" > "$bin/backends/tmux.sh"
+  if git -C "$ROOT" cat-file -e "$BASE_REF:bin/backends/tmux.sh" 2>/dev/null; then
+    git -C "$ROOT" show "$BASE_REF:bin/backends/tmux.sh" > "$bin/backends/tmux.sh"
+  fi
   for f in $OLD_BIN_REFACTORED; do
     git -C "$ROOT" show "$BASE_REF:bin/$f" > "$bin/$f"
     chmod +x "$bin/$f"
