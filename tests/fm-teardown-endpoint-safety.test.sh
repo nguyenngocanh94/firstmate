@@ -124,11 +124,15 @@ test_supported_backend_endpoint_records_validate() {
   fm_backend_validate_task_endpoint "$dir/home/state/$id.meta" "$id" || fail "valid Zellij endpoint refused"
 
   id=orca-task
+  orca_worktree_id='18bd61de-b76a-45ea-9f8c-55d082c7d046::/Volumes/Work/Workspace/worktree/teammate-bun/fm-tmb-m2-manualverify'
   fm_write_meta "$dir/home/state/$id.meta" \
     "window=fm-$id" "endpoint_task_id=$id" "terminal=term-7" \
-    "worktree=$dir/worktree" "project=$dir/project" "backend=orca" "orca_worktree_id=worktree-9"
+    "worktree=$dir/worktree" "project=$dir/project" "backend=orca" \
+    "orca_worktree_id=$orca_worktree_id"
   fm_backend_validate_task_endpoint "$dir/home/state/$id.meta" "$id" || fail "valid Orca endpoint refused"
   [ "$FM_BACKEND_VALIDATED_TARGET" = term-7 ] || fail "Orca validation did not select its terminal"
+  [ "$(fm_meta_get "$dir/home/state/$id.meta" orca_worktree_id)" = "$orca_worktree_id" ] \
+    || fail "Orca validation changed the opaque worktree id"
 
   id=cmux-task
   fm_write_meta "$dir/home/state/$id.meta" \
@@ -144,6 +148,79 @@ test_supported_backend_endpoint_records_validate() {
     [ "$target" -ne 0 ] || fail "$backend generic kill accepted an empty target"
   done
   pass "cleanup identity: valid tmux, Herdr, Zellij, Orca, and cmux records validate while every empty backend target refuses"
+}
+
+test_orca_worktree_id_validation_rejects_malformed_values() {
+  local dir id=orca-malformed rc out
+  # shellcheck source=/dev/null
+  . "$ROOT/bin/fm-backend.sh"
+
+  dir=$(make_case orca-empty)
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=fm-$id" "endpoint_task_id=$id" "terminal=term-7" \
+    "worktree=$dir/worktree" "project=$dir/project" "backend=orca" \
+    "orca_worktree_id="
+  set +e
+  out=$(fm_backend_validate_task_endpoint "$dir/home/state/$id.meta" "$id" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "empty Orca worktree id unexpectedly validated"
+  assert_contains "$out" "missing orca_worktree_id" "empty Orca worktree id refusal lost its specific reason"
+
+  dir=$(make_case orca-newline)
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=fm-$id" "endpoint_task_id=$id" "terminal=term-7" \
+    "worktree=$dir/worktree" "project=$dir/project" "backend=orca" \
+    "orca_worktree_id=bad"$'\n''orphan'
+  set +e
+  out=$(fm_backend_validate_task_endpoint "$dir/home/state/$id.meta" "$id" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "newline-injected Orca worktree id unexpectedly validated"
+  assert_contains "$out" "invalid control character" "newline-injected Orca worktree id refusal was not specific"
+
+  dir=$(make_case orca-injection)
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=fm-$id" "endpoint_task_id=$id" "terminal=term-7" \
+    "worktree=$dir/worktree" "project=$dir/project" "backend=orca" \
+    'orca_worktree_id=worktree;touch /tmp/should-not-run'
+  set +e
+  out=$(fm_backend_validate_task_endpoint "$dir/home/state/$id.meta" "$id" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "injection-shaped Orca worktree id unexpectedly validated"
+  assert_contains "$out" "command separator" "injection-shaped Orca worktree id refusal was not specific"
+
+  dir=$(make_case orca-terminal)
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=fm-$id" "endpoint_task_id=$id" "terminal=term;unsafe" \
+    "worktree=$dir/worktree" "project=$dir/project" "backend=orca" \
+    "orca_worktree_id=worktree-safe"
+  set +e
+  out=$(fm_backend_validate_task_endpoint "$dir/home/state/$id.meta" "$id" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "unsafe Orca terminal handle unexpectedly validated"
+  assert_contains "$out" "terminal handle" "unsafe Orca terminal handle refusal was not specific"
+
+  dir=$(make_case orca-nul)
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=fm-$id" "endpoint_task_id=$id" "terminal=term-7" \
+    "worktree=$dir/worktree" "project=$dir/project" "backend=orca" \
+    "orca_worktree_id=worktree-safe"
+  printf '\0' >> "$dir/home/state/$id.meta"
+  set +e
+  out=$(fm_backend_validate_task_endpoint "$dir/home/state/$id.meta" "$id" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "NUL-containing Orca metadata unexpectedly validated"
+  assert_contains "$out" "NUL byte" "NUL-containing Orca metadata refusal was not specific"
+
+  # Keep the shared atom contract unchanged for the session-provider ids that
+  # genuinely are single command-line tokens.
+  fm_backend_endpoint_atom_valid "tmux/session" && fail "strict endpoint atom accepted a tmux-shaped separator"
+  fm_backend_endpoint_atom_valid "herdr:workspace" && fail "strict endpoint atom accepted a Herdr-shaped separator"
+  pass "Orca worktree validation: compound ids pass intact while empty, control, NUL, and injection-shaped values refuse specifically"
 }
 
 test_tmux_empty_target_refuses_without_invocation() {
@@ -270,6 +347,7 @@ SH
 
 test_invalid_endpoint_records_refuse_before_mutation
 test_supported_backend_endpoint_records_validate
+test_orca_worktree_id_validation_rejects_malformed_values
 test_tmux_empty_target_refuses_without_invocation
 test_recorded_process_identity_cleanup_is_exact
 test_isolated_tmux_invalid_and_valid_cleanup
