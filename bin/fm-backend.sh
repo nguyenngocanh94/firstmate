@@ -383,6 +383,36 @@ fm_backend_endpoint_atom_valid() {  # <value>
   esac
 }
 
+# Orca owns an opaque worktree token, which may contain separators such as
+# `::`, `/`, and spaces. Keep that spelling intact while rejecting control
+# characters and command syntax before passing it back to the Orca CLI.
+fm_backend_orca_worktree_id_valid() {  # <value>
+  local value=${1-} char index char_code
+  [ -n "$value" ] || return 1
+  index=0
+  while [ "$index" -lt "${#value}" ]; do
+    char=${value:index:1}
+    LC_ALL=C printf -v char_code '%d' "'$char"
+    case "$char_code" in
+      0|9|10|13|34|36|38|39|40|41|59|60|62|91|92|93|96|123|124|125)
+        return 1
+        ;;
+    esac
+    index=$((index + 1))
+  done
+}
+
+# The continuation check catches a newline-injected non-record following the
+# worktree id without changing the line-oriented metadata format for others.
+fm_backend_orca_worktree_id_record_valid() {  # <meta-file>
+  local meta=$1
+  awk '
+    /^orca_worktree_id=/ { seen=1; next }
+    seen && $0 !~ /^[A-Za-z_][A-Za-z0-9_]*=/ { exit 1 }
+    { seen=0 }
+  ' "$meta"
+}
+
 fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
   local meta=$1 id=$2 backend_count backend window worktree project binding_count binding
   local session pane recorded_session workspace tab terminal worktree_id surface
@@ -392,6 +422,11 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
     echo "REFUSED: task $id has no regular endpoint metadata at $meta; preserving task state." >&2
     return 1
   }
+  # A NUL cannot survive in a Bash variable, so inspect the raw metadata too.
+  if ! cmp -s "$meta" <(LC_ALL=C tr -d '\0' < "$meta"); then
+    echo "REFUSED: task $id endpoint metadata contains a NUL byte; preserving task state." >&2
+    return 1
+  fi
   case "$id" in ''|*[!A-Za-z0-9._-]*)
     echo "REFUSED: task endpoint identity has an invalid task id; preserving task state." >&2
     return 1
@@ -501,10 +536,19 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
         echo "REFUSED: missing orca_worktree_id in $meta; cannot remove Orca worktree; preserving task state." >&2
         return 1
       }
-      if [ "$window" != "fm-$id" ] \
-        || ! fm_backend_endpoint_atom_valid "$terminal" \
-        || ! fm_backend_endpoint_atom_valid "$worktree_id"; then
-        echo "REFUSED: Orca endpoint metadata for task $id is malformed or inconsistent; preserving task state." >&2
+      if [ "$window" != "fm-$id" ]; then
+        echo "REFUSED: Orca endpoint alias '$window' does not belong to task $id; preserving task state." >&2
+        return 1
+      fi
+      # Terminal handles are simple CLI targets, so retain the strict atom
+      # validator used by the other session-provider endpoint handles.
+      if ! fm_backend_endpoint_atom_valid "$terminal"; then
+        echo "REFUSED: Orca terminal handle in $meta is malformed; preserving task state." >&2
+        return 1
+      fi
+      if ! fm_backend_orca_worktree_id_record_valid "$meta" \
+        || ! fm_backend_orca_worktree_id_valid "$worktree_id"; then
+        echo "REFUSED: Orca worktree id in $meta contains an invalid control character, command separator, or metadata line; preserving task state." >&2
         return 1
       fi
       window=$terminal
