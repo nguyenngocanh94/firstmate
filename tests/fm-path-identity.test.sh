@@ -131,7 +131,13 @@ pass "fm_path_git_worktree_names yields nothing for an unregistered location or 
 #
 # The real CLI keys its pool registry on the literal path string: `return`
 # succeeds for the name it recorded and prints "is not managed by treehouse" for
-# any other, and `status` prints its recorded name in a human-formatted line.
+# any other. `status` prints its recorded name in a human-formatted line that
+# ABBREVIATES a path under the user's home to `~/...`, while `status --json`
+# reports the unabbreviated literal path. The stub models both, because that
+# difference is the whole reason the json source is preferred: a pool reached
+# through a symlink out of $HOME is registered under its tilde-abbreviated human
+# spelling, and a recovery reading only the human output loses the one name
+# treehouse would accept. FM_FAKE_TH_HOME sets the prefix the stub abbreviates.
 # FM_FAKE_TH_REGISTERED is that one recorded name; FM_FAKE_TH_LOG records every
 # invocation so a test can prove which names were tried, and in what order.
 FAKEBIN="$TMP_ROOT/fakebin"
@@ -143,7 +149,21 @@ registered=${FM_FAKE_TH_REGISTERED:-}
 case "${1:-}" in
   status)
     [ "${FM_FAKE_TH_STATUS_BROKEN:-0}" = 1 ] && { echo "treehouse: simulated failure" >&2; exit 1; }
-    [ -z "$registered" ] || printf '1     available    %s\n' "$registered"
+    if [ "${2:-}" = --json ]; then
+      if [ -z "$registered" ]; then
+        printf '[]\n'
+      else
+        printf '[{"name":"1","path":"%s","status":"available","lease_id":"","lease_holder":"","leased_at":null,"processes":[]}]\n' "$registered"
+      fi
+      exit 0
+    fi
+    if [ -n "$registered" ]; then
+      shown=$registered
+      case "${FM_FAKE_TH_HOME:-}" in
+        ?*) case "$shown" in "$FM_FAKE_TH_HOME"/*) shown="~${shown#"$FM_FAKE_TH_HOME"}" ;; esac ;;
+      esac
+      printf '1     available    %s\n' "$shown"
+    fi
     exit 0
     ;;
   return)
@@ -184,6 +204,22 @@ mapfile -t names < <(fm_path_treehouse_pool_names "$PHYSICAL" "$REPO")
 [ "${#names[@]}" -eq 0 ] || fail "pool names: a failed status must yield nothing: ${names[*]}"
 unset FM_FAKE_TH_STATUS_BROKEN
 pass "fm_path_treehouse_pool_names yields nothing for an unregistered location or failed status"
+
+# The live incident (mexcmate, 2026-08-31): the pool root was reached through a
+# symlink out of $HOME, so treehouse registered the logical name and its HUMAN
+# status printed it abbreviated as `~/...`. A recovery that read only that human
+# line filtered the tilde spelling out as "not an absolute path" and returned no
+# candidate at all, so `treehouse return` was never retried under the one name
+# it would have accepted and scout teardown aborted with the task still live.
+FM_FAKE_TH_REGISTERED="$LOGICAL"
+export FM_FAKE_TH_HOME="$LINK"
+mapfile -t names < <(fm_path_treehouse_pool_names "$PHYSICAL" "$REPO")
+[ "${#names[@]}" -eq 1 ] \
+  || fail "pool names: a tilde-abbreviated human status must still yield the recorded name, got ${#names[@]}: ${names[*]}"
+[ "${names[0]}" = "$LOGICAL" ] \
+  || fail "pool names: want the unabbreviated $LOGICAL, got ${names[0]}"
+unset FM_FAKE_TH_HOME
+pass "fm_path_treehouse_pool_names survives a status line that abbreviates the home to ~"
 
 # --- fm_path_treehouse_return: both directions of the symlink ----------------
 
