@@ -108,15 +108,44 @@ fm_path_git_worktree_names() {  # <path> <repo-dir>
 # `treehouse status` run in <pool-dir> (treehouse resolves the pool from the
 # working directory). This is the authority for the name treehouse will accept,
 # including for a worktree created after an ancestor became a symlink, where no
-# other registry holds the logical name. Absolute-path tokens are collected
-# without relying on the output's human formatting and kept only when they
-# resolve to the same directory, so a pool path containing whitespace is simply
-# missed rather than mistaken for another location.
+# other registry holds the logical name.
+#
+# The structured `--json` registry is the primary source because its `path` is
+# always the literal absolute string treehouse recorded, while the HUMAN status
+# abbreviates a pool under the user's home to `~/...`. That abbreviation is the
+# live failure this recovery exists to answer: when the pool lives behind a
+# symlink out of $HOME, the tilde spelling is the ONLY name treehouse accepts,
+# and a token filter keyed on a leading `/` discards exactly that name, so the
+# retry loop is left with nothing and teardown aborts "not managed by
+# treehouse". Expanding the tilde here would re-derive a name rather than
+# reporting the one treehouse owns, so the recorded spelling is passed through
+# verbatim.
+#
+# The human parse remains as a fallback for hosts without jq. In both sources a
+# candidate is kept only when it resolves to the same directory, so a pool path
+# containing whitespace is simply missed rather than mistaken for another
+# location.
 fm_path_treehouse_pool_names() {  # <path> <pool-dir>
-  local path=$1 pool=$2 token
+  local path=$1 pool=$2 token status_json
   [ -n "$path" ] && [ -n "$pool" ] || return 0
   [ -d "$pool" ] || return 0
   command -v treehouse >/dev/null 2>&1 || return 0
+
+  if command -v jq >/dev/null 2>&1 \
+    && status_json=$( ( CDPATH='' cd -- "$pool" && treehouse status --json ) 2>/dev/null) \
+    && printf '%s' "$status_json" | jq -e '
+         type == "array" and all(.[]; type == "object" and (.path | type == "string"))
+       ' >/dev/null 2>&1
+  then
+    while IFS= read -r -d '' token; do
+      [ -n "$token" ] || continue
+      if fm_path_same_location "$token" "$path"; then
+        printf '%s\n' "$token"
+      fi
+    done < <(printf '%s' "$status_json" | jq -j '.[] | .path, "\u0000"')
+    return 0
+  fi
+
   ( CDPATH='' cd -- "$pool" && treehouse status ) 2>/dev/null |
     tr -s '[:space:]' '\n' |
     while IFS= read -r token; do
